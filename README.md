@@ -171,3 +171,5 @@ Cole o token em `GITHUB_TOKEN` no `.env`.
 - [ ] **Fase 2** — Buscar o diff do PR e enviar ao LLM.
 - [ ] **Fase 3** — Postar os comentários de revisão de volta no PR.
 - [ ] **Fase 4** — Refinos: comentários por linha, filtros, deduplicação.
+
+<!-- teste: validação do webhook em Wed Jul  1 20:25:28 -03 2026 -->
