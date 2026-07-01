@@ -1,16 +1,20 @@
 """Rota que recebe e valida os eventos de webhook do GitHub.
 
-Fase 1: valida a assinatura HMAC, filtra eventos `pull_request` relevantes
-(opened / synchronize / reopened) e apenas loga os dados no console.
-Ainda NÃO busca o diff nem chama LLM.
+Fase 1: valida a assinatura HMAC e filtra eventos `pull_request` relevantes
+(opened / synchronize / reopened).
+Fase 2: para esses eventos, busca o diff real do PR e chama o revisor via LLM
+em background, logando os comentários gerados. Ainda NÃO posta nada de volta
+no GitHub — isso fica para a Fase 3.
 """
 
+import asyncio
 import hashlib
 import hmac
 import logging
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 
+from . import github_client, llm_reviewer
 from .config import settings
 
 logger = logging.getLogger("pr_code_reviewer.webhook")
@@ -19,6 +23,51 @@ router = APIRouter()
 
 # Ações de pull_request que nos interessam nesta fase.
 RELEVANT_ACTIONS = {"opened", "synchronize", "reopened"}
+
+
+async def process_pull_request(
+    owner: str, repo: str, pull_number: int, pr_title: str
+) -> None:
+    """Busca o diff do PR e roda a revisão via LLM (executado em background).
+
+    Roda DEPOIS da resposta 200 já ter sido enviada ao GitHub, então pode
+    demorar o quanto for (chamada à API do GitHub + LLM) sem estourar o timeout
+    do webhook. Nunca levanta exceção para fora: qualquer erro é logado.
+    """
+    try:
+        diff = await github_client.get_pull_request_diff(owner, repo, pull_number)
+    except Exception:
+        logger.exception(
+            "Falha ao buscar o diff do PR #%s (%s/%s).", pull_number, owner, repo
+        )
+        return
+
+    logger.info(
+        "Diff do PR #%s obtido (%d caracteres). Iniciando revisão via LLM...",
+        pull_number,
+        len(diff),
+    )
+
+    # review_diff é síncrono (cliente da OpenAI bloqueante); rodamos numa thread
+    # para não bloquear o event loop do FastAPI.
+    comentarios = await asyncio.to_thread(llm_reviewer.review_diff, diff, pr_title)
+
+    if not comentarios:
+        logger.info("Revisão do PR #%s: nenhum comentário gerado.", pull_number)
+        return
+
+    logger.info(
+        "Revisão do PR #%s: %d comentário(s) gerado(s):", pull_number, len(comentarios)
+    )
+    for i, c in enumerate(comentarios, start=1):
+        logger.info(
+            "  [%d] %s:%s | severidade=%s | %s",
+            i,
+            c.get("arquivo"),
+            c.get("linha_aproximada"),
+            c.get("severidade"),
+            c.get("comentario"),
+        )
 
 
 def verify_signature(payload_body: bytes, signature_header: str | None) -> None:
@@ -55,13 +104,15 @@ def verify_signature(payload_body: bytes, signature_header: str | None) -> None:
 @router.post("/webhook/github")
 async def github_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_github_event: str | None = Header(default=None),
     x_hub_signature_256: str | None = Header(default=None),
 ):
     """Recebe eventos do GitHub Webhook.
 
-    Retorna 200 rapidamente (o GitHub espera resposta em poucos segundos).
-    Todo processamento pesado (diff, LLM, comentários) virá nas próximas fases.
+    Retorna 200 rapidamente (o GitHub espera resposta em poucos segundos). O
+    trabalho pesado (buscar o diff + revisão via LLM) é agendado em background
+    para não bloquear a resposta ao GitHub.
     """
     # Importante: assinar o corpo BRUTO, antes de qualquer parse de JSON.
     body = await request.body()
@@ -86,15 +137,28 @@ async def github_webhook(
     pr = payload.get("pull_request", {})
     repo = payload.get("repository", {})
 
+    number = pr.get("number")
+    title = pr.get("title")
+    owner = repo.get("owner", {}).get("login")
+    repo_name = repo.get("name")
+
     logger.info(
         "PR #%s | ação=%s | repo=%s | autor=%s | título=%s",
-        pr.get("number"),
+        number,
         action,
         repo.get("full_name"),
         pr.get("user", {}).get("login"),
-        pr.get("title"),
+        title,
     )
 
-    # Próximas fases: buscar o diff (github_client.get_pull_request_diff)
-    # e enviar ao LLM para gerar comentários de revisão.
-    return {"msg": "ok", "pr": pr.get("number"), "action": action}
+    # Agenda a busca do diff + revisão via LLM para depois da resposta 200.
+    if owner and repo_name and number is not None:
+        background_tasks.add_task(
+            process_pull_request, owner, repo_name, number, title or ""
+        )
+    else:
+        logger.warning(
+            "Payload sem owner/repo/number suficientes; revisão não agendada."
+        )
+
+    return {"msg": "ok", "pr": number, "action": action}

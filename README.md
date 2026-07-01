@@ -4,8 +4,10 @@ Bot que revisa **Pull Requests do GitHub** automaticamente. Ele recebe eventos d
 via webhook, envia o diff do código para um LLM e posta comentários de revisão
 diretamente no Pull Request.
 
-> **Status atual: Fase 1 — recepção e validação de webhooks.**
-> Ainda **não** chama o LLM nem posta comentários. Veja o [Roadmap](#roadmap).
+> **Status atual: Fase 2 — busca do diff + análise via LLM.**
+> Já recebe o PR, busca o diff real e gera comentários de revisão com um LLM
+> (logados no console). Ainda **não** posta os comentários de volta no PR —
+> isso é a Fase 3. Veja o [Roadmap](#roadmap).
 
 ---
 
@@ -29,7 +31,9 @@ e boas práticas em cada PR aberto ou atualizado.
 
 ---
 
-## O que já funciona (Fase 1)
+## O que já funciona
+
+### Fase 1 — Recepção e validação de webhooks
 
 - Endpoint `POST /webhook/github` que recebe eventos do GitHub.
 - **Validação da assinatura HMAC-SHA256** (`X-Hub-Signature-256`) usando o
@@ -38,8 +42,23 @@ e boas práticas em cada PR aberto ou atualizado.
   **reopened**.
 - Log no console com: número do PR, título, repositório, autor e ação.
 - Resposta `200 OK` rápida (o GitHub espera resposta em poucos segundos).
-- Função `github_client.get_pull_request_diff(...)` já pronta para buscar o diff
-  (ainda não é chamada — será usada na Fase 2).
+
+### Fase 2 — Busca do diff + análise via LLM
+
+- Para cada evento relevante, busca o **diff real** do PR via GitHub API
+  (`github_client.get_pull_request_diff`).
+- Envia o diff a um LLM da OpenAI (`gpt-4o-mini` por padrão) que atua como
+  **revisor de código sênior**, procurando bugs, riscos de segurança, más
+  práticas, código duplicado e problemas de performance
+  (`llm_reviewer.review_diff`).
+- O modelo responde **em JSON**; a resposta é parseada com tratamento de erro
+  (JSON malformado → loga e retorna lista vazia, sem quebrar o app).
+- Diffs muito grandes são **truncados** (~6000 tokens) para não estourar o
+  contexto nem gastar demais.
+- A busca do diff + revisão rodam em **background** (`BackgroundTasks`), então o
+  webhook continua respondendo `200 OK` de imediato ao GitHub.
+- Os comentários gerados (arquivo, linha aproximada, severidade, comentário)
+  são **logados no console**. Postar de volta no PR é a Fase 3.
 
 ---
 
@@ -50,8 +69,9 @@ pr-code-reviewer/
 ├── app/
 │   ├── __init__.py
 │   ├── main.py           # App FastAPI + rotas de status
-│   ├── webhook.py        # Rota que recebe/valida os eventos do GitHub
+│   ├── webhook.py        # Rota que recebe/valida os eventos + orquestra a revisão
 │   ├── github_client.py  # Funções para chamar a API do GitHub (buscar diff)
+│   ├── llm_reviewer.py   # Revisão de código via LLM (OpenAI)
 │   └── config.py         # Carregamento de variáveis de ambiente
 ├── .env.example
 ├── .gitignore
@@ -88,6 +108,9 @@ Edite o `.env` e preencha:
   ```
   (o **mesmo** valor precisa ser colado no GitHub ao criar o webhook).
 - `GITHUB_TOKEN` — um Personal Access Token do GitHub (veja abaixo).
+- `OPENAI_API_KEY` — chave da API da OpenAI, usada na revisão via LLM.
+  Gere em <https://platform.openai.com/api-keys>.
+- `OPENAI_MODEL` *(opcional)* — modelo usado na revisão. Padrão: `gpt-4o-mini`.
 
 ### 3. Subir o servidor
 
@@ -168,6 +191,6 @@ Cole o token em `GITHUB_TOKEN` no `.env`.
 ## Roadmap
 
 - [x] **Fase 1** — Recepção e validação de webhooks do GitHub.
-- [ ] **Fase 2** — Buscar o diff do PR e enviar ao LLM.
+- [x] **Fase 2** — Buscar o diff do PR e analisá-lo com um LLM (comentários no log).
 - [ ] **Fase 3** — Postar os comentários de revisão de volta no PR.
 - [ ] **Fase 4** — Refinos: comentários por linha, filtros, deduplicação.

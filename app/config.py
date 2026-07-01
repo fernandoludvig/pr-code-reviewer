@@ -26,5 +26,11 @@ class Settings:
     # Base da API do GitHub. Configurável para permitir GitHub Enterprise.
     GITHUB_API_URL: str = os.getenv("GITHUB_API_URL", "https://api.github.com")
 
+    # Chave da API da OpenAI, usada para a revisão de código via LLM (Fase 2).
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+
+    # Modelo usado na revisão. gpt-4o-mini pelo bom custo-benefício.
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 
 settings = Settings()
