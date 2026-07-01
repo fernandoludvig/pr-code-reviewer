@@ -4,10 +4,10 @@ Bot que revisa **Pull Requests do GitHub** automaticamente. Ele recebe eventos d
 via webhook, envia o diff do código para um LLM e posta comentários de revisão
 diretamente no Pull Request.
 
-> **Status atual: Fase 2 — busca do diff + análise via LLM.**
-> Já recebe o PR, busca o diff real e gera comentários de revisão com um LLM
-> (logados no console). Ainda **não** posta os comentários de volta no PR —
-> isso é a Fase 3. Veja o [Roadmap](#roadmap).
+> **Status atual: Fase 3 — postagem da review no PR.**
+> Fluxo completo: recebe o PR → busca o diff → gera comentários com um LLM →
+> **posta a review de volta no Pull Request** (event `COMMENT`, sem aprovar nem
+> bloquear). Veja o [Roadmap](#roadmap).
 
 ---
 
@@ -58,7 +58,22 @@ e boas práticas em cada PR aberto ou atualizado.
 - A busca do diff + revisão rodam em **background** (`BackgroundTasks`), então o
   webhook continua respondendo `200 OK` de imediato ao GitHub.
 - Os comentários gerados (arquivo, linha aproximada, severidade, comentário)
-  são **logados no console**. Postar de volta no PR é a Fase 3.
+  são **logados no console**.
+
+### Fase 3 — Postagem da review no PR
+
+- Posta os comentários de volta no PR via
+  `POST /repos/{owner}/{repo}/pulls/{n}/reviews`
+  (`github_client.submit_pr_review`), como **comentários por linha**.
+- Usa sempre `event="COMMENT"` — o bot **só sugere**, nunca aprova (`APPROVE`)
+  nem bloqueia (`REQUEST_CHANGES`) o PR.
+- Cada comentário leva um emoji de severidade: 🔴 alta, 🟡 média, 🟢 baixa.
+- Se **não houver problemas**, posta uma review positiva simples:
+  `✅ Revisão automática: nenhum problema crítico encontrado.`
+- **Fallback:** a API do GitHub só aceita comentários em linhas que fazem parte
+  do diff. Se a review por linha for rejeitada (HTTP 422), o bot reposta tudo
+  como uma **review geral** (comentários no corpo), sem derrubar a aplicação.
+- Requer `GITHUB_TOKEN` com permissão **Pull requests: Read and write**.
 
 ---
 
@@ -167,8 +182,9 @@ Em **Settings → Developer settings → Personal access tokens**:
 
 - **Classic:** marque o escopo `repo` (ou `public_repo` se o repositório for
   público).
-- **Fine-grained:** dê acesso ao repositório de teste com permissão de leitura
-  em **Pull requests** e **Contents**.
+- **Fine-grained:** dê acesso ao repositório de teste com **Contents: Read** e
+  **Pull requests: Read and write** (a escrita é necessária a partir da Fase 3
+  para o bot postar a review no PR).
 
 Cole o token em `GITHUB_TOKEN` no `.env`.
 
@@ -192,5 +208,5 @@ Cole o token em `GITHUB_TOKEN` no `.env`.
 
 - [x] **Fase 1** — Recepção e validação de webhooks do GitHub.
 - [x] **Fase 2** — Buscar o diff do PR e analisá-lo com um LLM (comentários no log).
-- [ ] **Fase 3** — Postar os comentários de revisão de volta no PR.
-- [ ] **Fase 4** — Refinos: comentários por linha, filtros, deduplicação.
+- [x] **Fase 3** — Postar os comentários de revisão de volta no PR (review `COMMENT`).
+- [ ] **Fase 4** — Refinos: deduplicação, filtros por severidade, retry por comentário.
