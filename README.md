@@ -1,18 +1,18 @@
 # PR Code Reviewer
 
-Bot que revisa **Pull Requests do GitHub** automaticamente. Ele recebe eventos de PR
-via webhook, envia o diff do código para um LLM e posta comentários de revisão
-diretamente no Pull Request.
+A bot that automatically reviews **GitHub Pull Requests**. It receives PR events
+via webhook, sends the code diff to an LLM and posts review comments directly on
+the Pull Request.
 
-> **Status atual: Fase 4 — robustez.**
-> Fluxo completo (recebe o PR → busca o diff → LLM → **posta a review no PR**),
-> agora com filtro por severidade, deduplicação, comentários ancorados na linha
-> com overflow para o corpo, e cache anti-reprocessamento. Veja o
-> [Roadmap](#roadmap) e as [Limitações conhecidas](#limitações-conhecidas).
+> **Status: Phase 4 — robustness.**
+> End-to-end flow (receive the PR → fetch the diff → LLM → **post the review on
+> the PR**), now with a severity filter, deduplication, line-anchored comments
+> with body overflow, and an anti-reprocessing cache. See the
+> [Roadmap](#roadmap) and the [Known limitations](#known-limitations).
 
 ---
 
-## Visão geral (produto final)
+## Overview (final product)
 
 ```
    GitHub PR (opened/synchronize/reopened)
@@ -20,90 +20,90 @@ diretamente no Pull Request.
             ▼
    ┌─────────────────────┐
    │  pr-code-reviewer    │  FastAPI
-   │  1. valida HMAC      │
-   │  2. busca o diff     │  ── GitHub API ──►
-   │  3. envia ao LLM     │  ── LLM ──►
-   │  4. posta comentários│  ── GitHub API ──►
+   │  1. validate HMAC    │
+   │  2. fetch the diff   │  ── GitHub API ──►
+   │  3. send to the LLM  │  ── LLM ──►
+   │  4. post comments    │  ── GitHub API ──►
    └─────────────────────┘
 ```
 
-O objetivo é ter um revisor automático que comenta problemas de código, sugestões
-e boas práticas em cada PR aberto ou atualizado.
+The goal is an automated reviewer that comments on code issues, suggestions and
+best practices on every PR that is opened or updated.
 
 ---
 
-## O que já funciona
+## What already works
 
-### Fase 1 — Recepção e validação de webhooks
+### Phase 1 — Webhook reception and validation
 
-- Endpoint `POST /webhook/github` que recebe eventos do GitHub.
-- **Validação da assinatura HMAC-SHA256** (`X-Hub-Signature-256`) usando o
-  `GITHUB_WEBHOOK_SECRET` — garante que o payload veio mesmo do GitHub.
-- Filtragem de eventos `pull_request` nas ações **opened**, **synchronize** e
-  **reopened**.
-- Log no console com: número do PR, título, repositório, autor e ação.
-- Resposta `200 OK` rápida (o GitHub espera resposta em poucos segundos).
+- `POST /webhook/github` endpoint that receives GitHub events.
+- **HMAC-SHA256 signature validation** (`X-Hub-Signature-256`) using the
+  `GITHUB_WEBHOOK_SECRET` — ensures the payload really came from GitHub.
+- Filtering of `pull_request` events for the **opened**, **synchronize** and
+  **reopened** actions.
+- Console logging of: PR number, title, repository, author and action.
+- Fast `200 OK` response (GitHub expects a response within a few seconds).
 
-### Fase 2 — Busca do diff + análise via LLM
+### Phase 2 — Diff fetch + LLM analysis
 
-- Para cada evento relevante, busca o **diff real** do PR via GitHub API
-  (`github_client.get_pull_request_diff`).
-- Envia o diff a um LLM da OpenAI (`gpt-4o-mini` por padrão) que atua como
-  **revisor de código sênior**, procurando bugs, riscos de segurança, más
-  práticas, código duplicado e problemas de performance
-  (`llm_reviewer.review_diff`).
-- O modelo responde **em JSON**; a resposta é parseada com tratamento de erro
-  (JSON malformado → loga e retorna lista vazia, sem quebrar o app).
-- Diffs muito grandes são **truncados** (~6000 tokens) para não estourar o
-  contexto nem gastar demais.
-- A busca do diff + revisão rodam em **background** (`BackgroundTasks`), então o
-  webhook continua respondendo `200 OK` de imediato ao GitHub.
-- Os comentários gerados (arquivo, linha aproximada, severidade, comentário)
-  são **logados no console**.
+- For each relevant event, fetches the **real diff** of the PR via the GitHub
+  API (`github_client.get_pull_request_diff`).
+- Sends the diff to an OpenAI LLM (`gpt-4o-mini` by default) that acts as a
+  **senior code reviewer**, looking for bugs, security risks, bad practices,
+  duplicated code and performance issues (`llm_reviewer.review_diff`).
+- The model responds **in JSON**; the response is parsed with error handling
+  (malformed JSON → logs and returns an empty list, without crashing the app).
+- Very large diffs are **truncated** (~6000 tokens) to avoid blowing past the
+  context or spending too much.
+- The diff fetch + review run in the **background** (`BackgroundTasks`), so the
+  webhook keeps responding `200 OK` to GitHub immediately.
+- The generated comments (file, approximate line, severity, comment) are
+  **logged to the console**.
 
-### Fase 3 — Postagem da review no PR
+### Phase 3 — Posting the review on the PR
 
-- Posta os comentários de volta no PR via
+- Posts the comments back to the PR via
   `POST /repos/{owner}/{repo}/pulls/{n}/reviews`
-  (`github_client.submit_pr_review`), como **comentários por linha**.
-- Usa sempre `event="COMMENT"` — o bot **só sugere**, nunca aprova (`APPROVE`)
-  nem bloqueia (`REQUEST_CHANGES`) o PR.
-- Cada comentário leva um emoji de severidade: 🔴 alta, 🟡 média, 🟢 baixa.
-- Se **não houver problemas**, posta uma review positiva simples:
-  `✅ Revisão automática: nenhum problema crítico encontrado.`
-- **Fallback:** a API do GitHub só aceita comentários em linhas que fazem parte
-  do diff. Se a review por linha for rejeitada (HTTP 422), o bot reposta tudo
-  como uma **review geral** (comentários no corpo), sem derrubar a aplicação.
-- Requer `GITHUB_TOKEN` com permissão **Pull requests: Read and write**.
+  (`github_client.submit_pr_review`), as **line comments**.
+- Always uses `event="COMMENT"` — the bot **only suggests**, it never approves
+  (`APPROVE`) nor blocks (`REQUEST_CHANGES`) the PR.
+- Each comment carries a severity emoji: 🔴 high, 🟡 medium, 🟢 low.
+- If **there are no problems**, it posts a simple positive review:
+  `✅ Automated review: no critical issues found.`
+- **Fallback:** the GitHub API only accepts comments on lines that are part of
+  the diff. If a line comment is rejected (HTTP 422), the bot reposts everything
+  as a **general review** (comments in the body), without crashing the app.
+- Requires a `GITHUB_TOKEN` with **Pull requests: Read and write** permission.
 
-### Fase 4 — Robustez
+### Phase 4 — Robustness
 
-- **Filtro por severidade** (`MIN_SEVERITY`): posta só o que estiver acima do
-  limite (`baixa` < `media` < `alta`; padrão `media`).
-- **Deduplicação:** se o LLM gera dois comentários para a mesma
-  `(arquivo, linha)`, mantém só o de maior severidade.
-- **Ancoragem precisa com overflow:** em vez de jogar tudo no corpo quando uma
-  linha não está no diff, o bot **parseia o diff** para saber quais linhas são
-  comentáveis. Os comentários válidos ficam **ancorados na linha**; só os que
-  caem fora do diff vão para o **corpo** da review — nada é descartado.
-- **Anti-reprocessamento:** um cache em memória guarda o `head.sha` já revisado
-  por PR (TTL). Pushes rápidos que disparam vários `synchronize` não gastam
-  chamadas ao LLM duas vezes para o mesmo commit.
+- **Severity filter** (`MIN_SEVERITY`): only posts what is at or above the
+  threshold (`low` < `medium` < `high`; default `medium`).
+- **Deduplication:** if the LLM generates two comments for the same
+  `(file, line)`, it keeps only the one with the highest severity.
+- **Precise anchoring with overflow:** instead of dumping everything into the
+  body when a line is not in the diff, the bot **parses the diff** to know which
+  lines are commentable. Valid comments stay **anchored to the line**; only the
+  ones that fall outside the diff go to the review **body** — nothing is
+  discarded.
+- **Anti-reprocessing:** an in-memory cache stores the already-reviewed
+  `head.sha` per PR (TTL). Rapid pushes that fire multiple `synchronize` events
+  don't spend LLM calls twice for the same commit.
 
 ---
 
-## Estrutura do projeto
+## Project structure
 
 ```
 pr-code-reviewer/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py           # App FastAPI + rotas de status
-│   ├── webhook.py        # Rota que recebe/valida os eventos + orquestra a revisão
-│   ├── github_client.py  # API do GitHub: buscar diff, postar review, parsear linhas
-│   ├── llm_reviewer.py   # Revisão de código via LLM (OpenAI)
-│   ├── dedup_cache.py    # Cache TTL em memória (anti-reprocessamento)
-│   └── config.py         # Carregamento de variáveis de ambiente
+│   ├── main.py           # FastAPI app + status routes
+│   ├── webhook.py        # Route that receives/validates events + orchestrates the review
+│   ├── github_client.py  # GitHub API: fetch diff, post review, parse lines
+│   ├── llm_reviewer.py   # LLM code review (OpenAI)
+│   ├── dedup_cache.py    # In-memory TTL cache (anti-reprocessing)
+│   └── config.py         # Environment variable loading
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -112,11 +112,11 @@ pr-code-reviewer/
 
 ---
 
-## Como rodar localmente
+## Running locally
 
-Requer **Python 3.12+**.
+Requires **Python 3.12+**.
 
-### 1. Criar o ambiente virtual e instalar dependências
+### 1. Create the virtual environment and install dependencies
 
 ```bash
 cd ~/pr-code-reviewer
@@ -125,128 +125,149 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configurar as variáveis de ambiente
+### 2. Configure the environment variables
 
 ```bash
 cp .env.example .env
 ```
 
-Edite o `.env` e preencha:
+Edit `.env` and fill in:
 
-- `GITHUB_WEBHOOK_SECRET` — um segredo forte e aleatório. Gere com:
+- `GITHUB_WEBHOOK_SECRET` — a strong, random secret. Generate one with:
   ```bash
   python -c "import secrets; print(secrets.token_hex(32))"
   ```
-  (o **mesmo** valor precisa ser colado no GitHub ao criar o webhook).
-- `GITHUB_TOKEN` — um Personal Access Token do GitHub (veja abaixo).
-- `OPENAI_API_KEY` — chave da API da OpenAI, usada na revisão via LLM.
-  Gere em <https://platform.openai.com/api-keys>.
-- `OPENAI_MODEL` *(opcional)* — modelo usado na revisão. Padrão: `gpt-4o-mini`.
-- `MIN_SEVERITY` *(opcional)* — severidade mínima para postar um comentário:
-  `baixa` < `media` < `alta`. Padrão: `media` (posta média e alta).
+  (the **same** value must be pasted into GitHub when creating the webhook).
+- `GITHUB_TOKEN` — a GitHub Personal Access Token (see below).
+- `OPENAI_API_KEY` — OpenAI API key, used for the LLM review.
+  Create one at <https://platform.openai.com/api-keys>.
+- `OPENAI_MODEL` *(optional)* — model used for the review. Default: `gpt-4o-mini`.
+- `MIN_SEVERITY` *(optional)* — minimum severity to post a comment:
+  `low` < `medium` < `high`. Default: `medium` (posts medium and high).
 
-### 3. Subir o servidor
+### 3. Start the server
 
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
-Teste que está no ar:
+Check that it is up:
 
 ```bash
 curl http://localhost:8000/health
 # {"status":"healthy"}
 ```
 
-### 4. Expor a porta com ngrok
+### 4. Expose the port with ngrok
 
-O GitHub precisa alcançar seu servidor pela internet. Com o
-[ngrok](https://ngrok.com/) instalado:
+GitHub needs to reach your server over the internet. With
+[ngrok](https://ngrok.com/) installed:
 
 ```bash
 ngrok http 8000
 ```
 
-Copie a URL pública gerada (ex.: `https://abcd-1234.ngrok-free.app`). O seu
-endpoint de webhook será:
+Copy the generated public URL (e.g. `https://abcd-1234.ngrok-free.app`). Your
+webhook endpoint will be:
 
 ```
 https://abcd-1234.ngrok-free.app/webhook/github
 ```
 
-> A URL gratuita do ngrok muda a cada reinício — atualize o webhook no GitHub
-> quando isso acontecer.
+> The free ngrok URL changes on each restart — update the webhook on GitHub
+> when that happens.
 
 ---
 
-## Como configurar o GitHub Webhook
+## Configuring the GitHub Webhook
 
-1. Crie (ou use) um repositório de teste no seu GitHub.
-2. Vá em **Settings → Webhooks → Add webhook**.
-3. Preencha:
-   - **Payload URL:** a URL do ngrok + `/webhook/github`
-     (ex.: `https://abcd-1234.ngrok-free.app/webhook/github`).
+1. Create (or use) a test repository on your GitHub.
+2. Go to **Settings → Webhooks → Add webhook**.
+3. Fill in:
+   - **Payload URL:** the ngrok URL + `/webhook/github`
+     (e.g. `https://abcd-1234.ngrok-free.app/webhook/github`).
    - **Content type:** `application/json`.
-   - **Secret:** o **mesmo** valor de `GITHUB_WEBHOOK_SECRET` do seu `.env`.
-   - **Which events?** → **Let me select individual events** → marque apenas
-     **Pull requests** (desmarque "Pushes" se estiver marcado).
-   - Deixe **Active** ligado.
-4. Clique em **Add webhook**. O GitHub envia um evento `ping` — o servidor
-   responde `{"msg":"pong"}` e você verá um ✅ na aba **Recent Deliveries**.
+   - **Secret:** the **same** value as `GITHUB_WEBHOOK_SECRET` in your `.env`.
+   - **Which events?** → **Let me select individual events** → check only
+     **Pull requests** (uncheck "Pushes" if it is checked).
+   - Keep **Active** on.
+4. Click **Add webhook**. GitHub sends a `ping` event — the server responds
+   `{"msg":"pong"}` and you will see a ✅ in the **Recent Deliveries** tab.
 
-### Criar o Personal Access Token (`GITHUB_TOKEN`)
+### Creating the Personal Access Token (`GITHUB_TOKEN`)
 
-Em **Settings → Developer settings → Personal access tokens**:
+In **Settings → Developer settings → Personal access tokens**:
 
-- **Classic:** marque o escopo `repo` (ou `public_repo` se o repositório for
-  público).
-- **Fine-grained:** dê acesso ao repositório de teste com **Contents: Read** e
-  **Pull requests: Read and write** (a escrita é necessária a partir da Fase 3
-  para o bot postar a review no PR).
+- **Classic:** check the `repo` scope (or `public_repo` if the repository is
+  public).
+- **Fine-grained:** grant access to the test repository with **Contents: Read**
+  and **Pull requests: Read and write** (write is required from Phase 3 on so
+  the bot can post the review on the PR).
 
-Cole o token em `GITHUB_TOKEN` no `.env`.
+Paste the token into `GITHUB_TOKEN` in `.env`.
 
 ---
 
-## Testar
+## Testing
 
-1. Com o `uvicorn` e o `ngrok` rodando, abra um **Pull Request** no repositório
-   de teste (ou faça um novo commit em um PR já aberto para disparar
-   `synchronize`).
-2. No console do servidor você verá uma linha como:
+### Locally, without opening a real PR
+
+The `scripts/test_webhook_local.py` script exercises the whole pipeline offline
+(HMAC + `BackgroundTasks` + real LLM review), mocking the diff fetch and the
+GitHub posting:
+
+```bash
+source .venv/bin/activate
+python scripts/test_webhook_local.py
+```
+
+It prints the deterministic checks (filter/dedupe/split), the payload that would
+be posted, and demonstrates the event deduplication. To test another minimum
+severity: `MIN_SEVERITY=high python scripts/test_webhook_local.py`.
+
+To post for real on a test PR, set `POST_TO_GITHUB = True` and `REAL_PR_NUMBER`
+at the top of the script.
+
+### End-to-end with GitHub
+
+1. With `uvicorn` and `ngrok` running, open a **Pull Request** on the test
+   repository (or push a new commit to an open PR to fire `synchronize`).
+2. In the server console you will see a line like:
    ```
-   ... | INFO | pr_code_reviewer.webhook | PR #1 | ação=opened | repo=seu-user/repo-teste | autor=seu-user | título=Meu PR de teste
+   ... | INFO | pr_code_reviewer.webhook | PR #1 | action=opened | repo=your-user/test-repo | author=your-user | title=My test PR
    ```
-3. Em **Settings → Webhooks → Recent Deliveries** você pode reenviar
-   (**Redeliver**) qualquer evento para depurar sem abrir novos PRs.
+3. In **Settings → Webhooks → Recent Deliveries** you can **Redeliver** any
+   event to debug without opening new PRs.
 
 ---
 
 ## Roadmap
 
-- [x] **Fase 1** — Recepção e validação de webhooks do GitHub.
-- [x] **Fase 2** — Buscar o diff do PR e analisá-lo com um LLM (comentários no log).
-- [x] **Fase 3** — Postar os comentários de revisão de volta no PR (review `COMMENT`).
-- [x] **Fase 4** — Robustez: filtro por severidade, deduplicação, ancoragem
-  precisa com overflow, e cache anti-reprocessamento.
+- [x] **Phase 1** — GitHub webhook reception and validation.
+- [x] **Phase 2** — Fetch the PR diff and analyze it with an LLM (comments in the log).
+- [x] **Phase 3** — Post the review comments back to the PR (`COMMENT` review).
+- [x] **Phase 4** — Robustness: severity filter, deduplication, precise anchoring
+  with overflow, and an anti-reprocessing cache.
 
 ---
 
-## Limitações conhecidas
+## Known limitations
 
-Pontos que são conscientemente simplificados neste escopo de portfólio e que,
-em produção real, mereceriam evolução:
+Points that are intentionally simplified for a portfolio scope and that, in real
+production, would deserve improvement:
 
-- **Cache anti-reprocessamento é só em memória** (`app/dedup_cache.py`): um dict
-  no processo, com TTL. Ele **reseta se o servidor reiniciar** e **não é
-  compartilhado entre múltiplas instâncias**. Em produção usaria Redis ou um
-  banco de dados para persistir e coordenar entre réplicas.
-- **`linha_aproximada` vem do LLM:** a ancoragem depende de o modelo estimar a
-  linha corretamente. O parsing do diff mitiga isso (linhas fora do diff caem no
-  corpo), mas não garante a linha semanticamente perfeita.
-- **Sem retentativa/enfileiramento:** se a chamada ao LLM ou ao GitHub falhar, o
-  evento é apenas logado — não há retry com backoff nem fila (ex.: Celery/RQ).
-- **Truncamento de diffs grandes:** diffs muito extensos são cortados (~6000
-  tokens), então PRs enormes podem não ser revisados por completo.
-- **Processamento via `BackgroundTasks`:** roda no mesmo processo do servidor;
-  cargas altas se beneficiariam de um worker/fila dedicado.
+- **The anti-reprocessing cache is in-memory only** (`app/dedup_cache.py`): a
+  dict in the process, with a TTL. It **resets when the server restarts** and is
+  **not shared across multiple instances**. In production it would use Redis or
+  a database to persist and coordinate across replicas.
+- **The line number comes from the LLM:** anchoring depends on the model
+  estimating the line correctly. Parsing the diff mitigates this (lines outside
+  the diff go to the body), but it does not guarantee the semantically perfect
+  line.
+- **No retry/queueing:** if the LLM or GitHub call fails, the event is only
+  logged — there is no retry with backoff nor a queue (e.g. Celery/RQ).
+- **Large-diff truncation:** very large diffs are cut (~6000 tokens), so huge
+  PRs may not be fully reviewed.
+- **Processing via `BackgroundTasks`:** runs in the same server process; high
+  load would benefit from a dedicated worker/queue.
+```

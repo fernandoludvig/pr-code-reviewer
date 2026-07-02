@@ -1,7 +1,7 @@
-"""Aplicação FastAPI do PR Code Reviewer.
+"""PR Code Reviewer FastAPI application.
 
-Ponto de entrada do servidor. Configura o logging e registra as rotas.
-Rodar em desenvolvimento com:
+Server entry point. Configures logging and registers the routes.
+Run in development with:
 
     uvicorn app.main:app --reload --port 8000
 """
@@ -19,7 +19,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="PR Code Reviewer",
-    description="Bot que revisa Pull Requests do GitHub automaticamente.",
+    description="Bot that automatically reviews GitHub Pull Requests.",
     version="0.1.0",
 )
 
@@ -28,11 +28,11 @@ app.include_router(webhook_router)
 
 @app.get("/")
 async def root():
-    """Rota raiz — útil para checar rapidamente se o serviço está no ar."""
+    """Root route — handy to quickly check that the service is up."""
     return {"service": "pr-code-reviewer", "status": "ok", "phase": 1}
 
 
 @app.get("/health")
 async def health():
-    """Health check simples para monitoramento."""
+    """Simple health check for monitoring."""
     return {"status": "healthy"}

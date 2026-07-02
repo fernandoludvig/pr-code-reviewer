@@ -1,40 +1,40 @@
-"""Carregamento de variáveis de ambiente.
+"""Environment variable loading.
 
-Lê o arquivo `.env` (via python-dotenv) e expõe as configurações do projeto
-através de um objeto `settings` único, importado pelos demais módulos.
+Reads the `.env` file (via python-dotenv) and exposes the project configuration
+through a single `settings` object imported by the other modules.
 """
 
 import os
 
 from dotenv import load_dotenv
 
-# Carrega o .env da raiz do projeto para dentro de os.environ (se existir).
+# Load the project's .env into os.environ (if it exists).
 load_dotenv()
 
 
 class Settings:
-    """Configurações da aplicação lidas do ambiente."""
+    """Application settings read from the environment."""
 
-    # Segredo compartilhado com o GitHub Webhook. Usado para validar o HMAC
-    # de cada requisição e garantir que o payload realmente veio do GitHub.
+    # Shared secret configured in the GitHub Webhook. Used to validate the HMAC
+    # of every request and ensure the payload really came from GitHub.
     GITHUB_WEBHOOK_SECRET: str = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 
-    # Personal Access Token (classic ou fine-grained) usado para chamar a
-    # API do GitHub — por enquanto só para buscar o diff dos PRs.
+    # Personal Access Token (classic or fine-grained) used to call the GitHub
+    # API — to fetch the PR diff and to post the review back.
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
 
-    # Base da API do GitHub. Configurável para permitir GitHub Enterprise.
+    # GitHub API base URL. Configurable to support GitHub Enterprise.
     GITHUB_API_URL: str = os.getenv("GITHUB_API_URL", "https://api.github.com")
 
-    # Chave da API da OpenAI, usada para a revisão de código via LLM (Fase 2).
+    # OpenAI API key, used for the LLM code review.
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
-    # Modelo usado na revisão. gpt-4o-mini pelo bom custo-benefício.
+    # Model used for the review. gpt-4o-mini for its good cost/quality ratio.
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    # Severidade mínima para um comentário ser postado no PR.
-    # Valores: "baixa" < "media" < "alta". Padrão: "media".
-    MIN_SEVERITY: str = os.getenv("MIN_SEVERITY", "media")
+    # Minimum severity for a comment to be posted on the PR.
+    # Values: "low" < "medium" < "high". Default: "medium".
+    MIN_SEVERITY: str = os.getenv("MIN_SEVERITY", "medium")
 
 
 settings = Settings()

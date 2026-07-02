@@ -1,8 +1,8 @@
-"""Revisão de código via LLM (OpenAI).
+"""LLM code review (OpenAI).
 
-Fase 2: recebe o diff bruto de um PR e pede a um modelo da OpenAI para agir como
-revisor de código sênior, retornando uma lista estruturada de comentários.
-Ainda NÃO posta nada de volta no GitHub — isso fica para a Fase 3.
+Takes the raw diff of a PR and asks an OpenAI model to act as a senior code
+reviewer, returning a structured list of comments. Posting them back to GitHub
+is handled by `webhook.py` / `github_client.py`.
 """
 
 import json
@@ -14,54 +14,54 @@ from .config import settings
 
 logger = logging.getLogger("pr_code_reviewer.llm_reviewer")
 
-# --- Limites de tamanho do diff -------------------------------------------
-# Truncamos diffs muito grandes para não estourar o contexto do modelo nem
-# gastar tokens à toa. Usamos uma heurística grosseira de ~4 chars por token.
+# --- Diff size limits -----------------------------------------------------
+# Very large diffs are truncated so we don't blow past the model context nor
+# waste tokens. We use a rough heuristic of ~4 chars per token.
 MAX_DIFF_TOKENS = 6000
 CHARS_PER_TOKEN = 4
 MAX_DIFF_CHARS = MAX_DIFF_TOKENS * CHARS_PER_TOKEN
 
-# Severidades aceitas; qualquer valor fora disso é normalizado para "baixa".
-SEVERIDADES_VALIDAS = {"alta", "media", "baixa"}
+# Accepted severities; anything else is normalized to "low".
+VALID_SEVERITIES = {"high", "medium", "low"}
 
 SYSTEM_PROMPT = (
-    "Você é um revisor de código sênior, experiente, objetivo e rigoroso. "
-    "Sua tarefa é analisar o diff de um Pull Request e apontar apenas problemas "
-    "reais e acionáveis, nas seguintes categorias: bugs e erros de lógica; "
-    "riscos de segurança (ex.: SQL/command injection, XSS, exposição de "
-    "credenciais ou segredos, uso inseguro de entrada do usuário); más práticas "
-    "de código; código duplicado; e problemas de performance. "
-    "Não invente problemas nem faça comentários de estilo triviais: se o código "
-    "estiver correto e seguro, não force apontamentos. Analise apenas as linhas "
-    "adicionadas/alteradas no diff. Responda em português."
+    "You are a senior code reviewer: experienced, objective and rigorous. "
+    "Your task is to analyze the diff of a Pull Request and point out only real, "
+    "actionable problems in the following categories: bugs and logic errors; "
+    "security risks (e.g. SQL/command injection, XSS, exposure of credentials or "
+    "secrets, unsafe use of user input); bad practices; duplicated code; and "
+    "performance issues. "
+    "Do not invent problems or make trivial style nitpicks: if the code is "
+    "correct and safe, do not force findings. Only analyze the added/changed "
+    "lines in the diff. Respond in English."
 )
 
 
 def _truncate_diff(diff_text: str) -> str:
-    """Trunca o diff se ele exceder o limite de tamanho, avisando no log."""
+    """Truncate the diff if it exceeds the size limit, warning in the log."""
     if len(diff_text) <= MAX_DIFF_CHARS:
         return diff_text
     logger.warning(
-        "Diff grande (%d caracteres ~ %d tokens); truncando para ~%d tokens.",
+        "Large diff (%d chars ~ %d tokens); truncating to ~%d tokens.",
         len(diff_text),
         len(diff_text) // CHARS_PER_TOKEN,
         MAX_DIFF_TOKENS,
     )
-    return diff_text[:MAX_DIFF_CHARS] + "\n\n[... diff truncado por tamanho ...]"
+    return diff_text[:MAX_DIFF_CHARS] + "\n\n[... diff truncated by size ...]"
 
 
 def _build_user_prompt(diff_text: str, pr_title: str) -> str:
-    """Monta a instrução do usuário pedindo resposta estritamente em JSON."""
+    """Build the user instruction asking for a strictly-JSON response."""
     return (
-        f"Título do PR: {pr_title}\n\n"
-        "Analise o diff abaixo (formato unified diff) e responda SOMENTE com um "
-        "objeto JSON, sem texto fora do JSON, no formato:\n"
-        '{"comentarios": [\n'
-        '  {"arquivo": "caminho/do/arquivo.py", "linha_aproximada": 42, '
-        '"severidade": "alta|media|baixa", '
-        '"comentario": "descrição objetiva do problema e sugestão de correção"}\n'
+        f"PR title: {pr_title}\n\n"
+        "Analyze the diff below (unified diff format) and respond ONLY with a "
+        "JSON object, with no text outside the JSON, in this shape:\n"
+        '{"comments": [\n'
+        '  {"file": "path/to/file.py", "line": 42, '
+        '"severity": "high|medium|low", '
+        '"comment": "objective description of the issue and a fix suggestion"}\n'
         "]}\n"
-        'Se não houver nenhum problema relevante, retorne {"comentarios": []}.\n\n'
+        'If there is no relevant problem, return {"comments": []}.\n\n'
         "Diff:\n"
         "```diff\n"
         f"{diff_text}\n"
@@ -70,58 +70,58 @@ def _build_user_prompt(diff_text: str, pr_title: str) -> str:
 
 
 def _parse_response(content: str) -> list[dict]:
-    """Faz o parsing robusto do JSON retornado pelo modelo.
+    """Robustly parse the JSON returned by the model.
 
-    Aceita tanto um array direto quanto um objeto {"comentarios": [...]}.
-    Em qualquer erro de formato, loga e retorna [] em vez de quebrar.
+    Accepts either a bare array or an object {"comments": [...]}. On any format
+    error, it logs and returns [] instead of raising.
     """
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
-        logger.error("Resposta do modelo não é JSON válido: %s", content[:500])
+        logger.error("Model response is not valid JSON: %s", content[:500])
         return []
 
-    # O modelo pode devolver o array dentro de uma chave "comentarios".
+    # The model may return the array inside a "comments" key.
     if isinstance(data, dict):
-        data = data.get("comentarios", [])
+        data = data.get("comments", [])
 
     if not isinstance(data, list):
-        logger.error("Formato inesperado na resposta do modelo: %r", data)
+        logger.error("Unexpected shape in the model response: %r", data)
         return []
 
-    comentarios: list[dict] = []
+    comments: list[dict] = []
     for item in data:
         if not isinstance(item, dict):
             continue
-        severidade = str(item.get("severidade", "baixa")).lower()
-        if severidade not in SEVERIDADES_VALIDAS:
-            severidade = "baixa"
-        comentarios.append(
+        severity = str(item.get("severity", "low")).lower()
+        if severity not in VALID_SEVERITIES:
+            severity = "low"
+        comments.append(
             {
-                "arquivo": item.get("arquivo", "?"),
-                "linha_aproximada": item.get("linha_aproximada"),
-                "severidade": severidade,
-                "comentario": item.get("comentario", ""),
+                "file": item.get("file", "?"),
+                "line": item.get("line"),
+                "severity": severity,
+                "comment": item.get("comment", ""),
             }
         )
-    return comentarios
+    return comments
 
 
 def review_diff(diff_text: str, pr_title: str) -> list[dict]:
-    """Revisa o diff de um PR usando um LLM e retorna uma lista de comentários.
+    """Review a PR diff using an LLM and return a list of comments.
 
-    Retorna uma lista de dicts no formato:
-        {"arquivo", "linha_aproximada", "severidade", "comentario"}
+    Returns a list of dicts in the shape:
+        {"file", "line", "severity", "comment"}
 
-    Nunca levanta exceção por falha do modelo/parsing: em qualquer erro, loga e
-    retorna [] para não derrubar a aplicação.
+    Never raises on model/parsing failure: on any error it logs and returns []
+    so the application does not crash.
     """
     if not settings.OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY não configurada; pulando revisão via LLM.")
+        logger.error("OPENAI_API_KEY not configured; skipping LLM review.")
         return []
 
     if not diff_text or not diff_text.strip():
-        logger.info("Diff vazio; nada para revisar.")
+        logger.info("Empty diff; nothing to review.")
         return []
 
     diff_text = _truncate_diff(diff_text)
@@ -139,8 +139,8 @@ def review_diff(diff_text: str, pr_title: str) -> list[dict]:
         )
         content = response.choices[0].message.content or ""
     except Exception:
-        # Erros de rede, autenticação, rate limit, etc. — não devem quebrar o app.
-        logger.exception("Erro ao chamar a API da OpenAI.")
+        # Network, auth, rate-limit, etc. errors must not crash the app.
+        logger.exception("Error calling the OpenAI API.")
         return []
 
     return _parse_response(content)

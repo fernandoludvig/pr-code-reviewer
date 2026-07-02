@@ -1,23 +1,23 @@
-"""Teste local do fluxo do webhook — com dois modos.
+"""Local webhook flow test — with two modes.
 
-MODO SEGURO (padrão, POST_TO_GITHUB = False):
-    1) Checagens DETERMINÍSTICAS (sem custo): filtro por severidade, deduplicação
-       e split ancorado/overflow.
-    2) Fluxo completo do webhook OFFLINE (HMAC + BackgroundTasks + review via LLM
-       real), com a busca do diff mockada e a postagem interceptada/impressa.
-    3) Reenvia o MESMO evento (mesmo head.sha) para mostrar a deduplicação de
-       evento (o segundo é ignorado, sem gastar tokens).
+SAFE MODE (default, POST_TO_GITHUB = False):
+    1) DETERMINISTIC checks (no cost): severity filter, deduplication and the
+       anchored/overflow split.
+    2) Full webhook flow OFFLINE (HMAC + BackgroundTasks + real LLM review),
+       with the diff fetch mocked and the posting intercepted/printed.
+    3) Re-sends the SAME event (same head.sha) to show event deduplication (the
+       second one is skipped, spending no tokens).
 
-MODO REAL (POST_TO_GITHUB = True):
-    ⚠️ Posta comentários DE VERDADE num PR real. Ajuste REAL_OWNER/REAL_REPO/
-    REAL_PR_NUMBER. Busca o diff real, roda a revisão e posta sem mocks.
+REAL MODE (POST_TO_GITHUB = True):
+    ⚠️ Posts real comments on a real PR. Adjust REAL_OWNER/REAL_REPO/
+    REAL_PR_NUMBER. Fetches the real diff, runs the review and posts, no mocks.
 
-Uso:
+Usage:
     source .venv/bin/activate
     python scripts/test_webhook_local.py
 
-    # testar outra severidade mínima:
-    MIN_SEVERITY=alta python scripts/test_webhook_local.py
+    # test another minimum severity:
+    MIN_SEVERITY=high python scripts/test_webhook_local.py
 """
 
 import asyncio
@@ -29,7 +29,7 @@ import os
 import sys
 from unittest.mock import patch
 
-# Garante que a raiz do projeto está no sys.path, mesmo rodando de scripts/.
+# Make sure the project root is on sys.path, even when run from scripts/.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient
@@ -41,14 +41,14 @@ from app.main import app
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
 
 # ---------------------------------------------------------------------------
-# CONFIGURAÇÃO — mude aqui para ativar o modo real.
+# CONFIG — change here to enable real mode.
 # ---------------------------------------------------------------------------
-POST_TO_GITHUB = False  # ⚠️ True = posta comentário REAL no PR abaixo.
+POST_TO_GITHUB = False  # ⚠️ True = posts real comments on the PR below.
 REAL_OWNER = "fernandoludvig"
 REAL_REPO = "pr-code-reviewer"
-REAL_PR_NUMBER = 2  # ajuste para o número do seu PR de teste.
+REAL_PR_NUMBER = 3  # adjust to your test PR number.
 
-# Diff de exemplo com problemas propositais (SQL injection + senha hardcoded).
+# Sample diff with intentional problems (SQL injection + hardcoded password).
 FAKE_DIFF = '''diff --git a/api/users.py b/api/users.py
 --- a/api/users.py
 +++ b/api/users.py
@@ -62,20 +62,20 @@ FAKE_DIFF = '''diff --git a/api/users.py b/api/users.py
 
 
 def demo_helpers() -> None:
-    """Checagens determinísticas das melhorias da Fase 4 (sem LLM, sem GitHub)."""
+    """Deterministic checks of the Phase 4 improvements (no LLM, no GitHub)."""
     sample = [
-        {"arquivo": "api/users.py", "linha_aproximada": 1, "severidade": "alta", "comentario": "senha hardcoded"},
-        {"arquivo": "api/users.py", "linha_aproximada": 1, "severidade": "baixa", "comentario": "mesmo ponto, dup"},
-        {"arquivo": "api/users.py", "linha_aproximada": 4, "severidade": "media", "comentario": "sql injection"},
-        {"arquivo": "api/users.py", "linha_aproximada": 50, "severidade": "baixa", "comentario": "nitpick de estilo"},
-        {"arquivo": "api/users.py", "linha_aproximada": 999, "severidade": "alta", "comentario": "linha fora do diff"},
+        {"file": "api/users.py", "line": 1, "severity": "high", "comment": "hardcoded password"},
+        {"file": "api/users.py", "line": 1, "severity": "low", "comment": "same spot, dup"},
+        {"file": "api/users.py", "line": 4, "severity": "medium", "comment": "sql injection"},
+        {"file": "api/users.py", "line": 50, "severity": "low", "comment": "style nitpick"},
+        {"file": "api/users.py", "line": 999, "severity": "high", "comment": "line outside the diff"},
     ]
-    filt = webhook._filter_by_severity(sample, "media")
-    print(f"  filtro (>= media):  {len(sample)} -> {len(filt)}  (remove as 'baixa')")
+    filt = webhook._filter_by_severity(sample, "medium")
+    print(f"  severity filter (>= medium):  {len(sample)} -> {len(filt)}  (drops the 'low' ones)")
     ded = webhook._dedupe_comments(filt)
-    print(f"  deduplicação:       {len(filt)} -> {len(ded)}  (junta os da mesma linha)")
+    print(f"  deduplication:                {len(filt)} -> {len(ded)}  (merges same-line ones)")
     anc, ovf = webhook._split_comments(ded, github_client.valid_diff_lines(FAKE_DIFF))
-    print(f"  split ancora/corpo: {len(anc)} ancorado(s), {len(ovf)} no corpo (linha 999 fora do diff)")
+    print(f"  anchor/body split:            {len(anc)} anchored, {len(ovf)} in the body (line 999 outside the diff)")
 
 
 def _post_event(client: TestClient, payload: dict) -> None:
@@ -96,12 +96,12 @@ def _post_event(client: TestClient, payload: dict) -> None:
 
 
 def run_safe_mode() -> None:
-    """Fluxo completo offline; a postagem no GitHub é apenas simulada/impressa."""
+    """Full offline flow; the GitHub posting is only simulated/printed."""
     payload = {
         "action": "opened",
         "pull_request": {
             "number": 999,
-            "title": "PR de teste local",
+            "title": "Local test PR",
             "user": {"login": "fernandoludvig"},
             "head": {"sha": "fakesha1234567890"},
         },
@@ -117,37 +117,37 @@ def run_safe_mode() -> None:
         return FAKE_DIFF
 
     async def fake_submit_review(owner, repo, pull_number, comments, commit_id, **kw):
-        print("\n===== PAYLOAD QUE SERIA POSTADO NO GITHUB (mock) =====")
+        print("\n===== PAYLOAD THAT WOULD BE POSTED TO GITHUB (mock) =====")
         print(json.dumps(
             {"commit_id": commit_id, "event": kw.get("event", "COMMENT"),
-             "body": kw.get("body", "🤖 Revisão automática de código"),
+             "body": kw.get("body", "🤖 Automated code review"),
              "overflow": kw.get("overflow"), "comments": comments},
             indent=2, ensure_ascii=False,
         ))
-        print("======================================================")
+        print("========================================================")
         return {"ok": True, "fallback": False, "posted_line_comments": len(comments)}
 
-    print("--- 1) Checagens determinísticas (filtro / dedupe / split) ---")
+    print("--- 1) Deterministic checks (filter / dedupe / split) ---")
     demo_helpers()
 
     with patch.object(github_client, "get_pull_request_diff", fake_get_diff), \
          patch.object(github_client, "submit_pr_review", fake_submit_review):
         client = TestClient(app)
-        print("\n--- 2) Fluxo completo do webhook (LLM real) ---")
+        print("\n--- 2) Full webhook flow (real LLM) ---")
         _post_event(client, payload)
-        print("\n--- 3) MESMO evento de novo (head.sha repetido) deve ser ignorado ---")
+        print("\n--- 3) SAME event again (repeated head.sha) should be skipped ---")
         _post_event(client, payload)
 
 
 def run_real_mode() -> None:
-    """⚠️ Fluxo REAL: busca o diff, revisa e POSTA a review no PR de verdade."""
+    """⚠️ REAL flow: fetches the diff, reviews and POSTS the review on the PR."""
     print(
-        f"⚠️  MODO REAL — vai postar comentários no PR #{REAL_PR_NUMBER} de "
+        f"⚠️  REAL MODE — will post comments on PR #{REAL_PR_NUMBER} of "
         f"{REAL_OWNER}/{REAL_REPO}."
     )
     asyncio.run(
         webhook.process_pull_request(
-            REAL_OWNER, REAL_REPO, REAL_PR_NUMBER, "Teste de review real", None
+            REAL_OWNER, REAL_REPO, REAL_PR_NUMBER, "Real review test", None
         )
     )
 
@@ -156,6 +156,6 @@ if __name__ == "__main__":
     if POST_TO_GITHUB:
         run_real_mode()
     else:
-        print("MODO SEGURO (offline). Para postar de verdade, defina "
-              "POST_TO_GITHUB = True no topo do script.\n")
+        print("SAFE MODE (offline). To post for real, set "
+              "POST_TO_GITHUB = True at the top of the script.\n")
         run_safe_mode()

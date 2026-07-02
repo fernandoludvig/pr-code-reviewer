@@ -1,8 +1,8 @@
-"""Funções para chamar a API do GitHub.
+"""Functions to call the GitHub API.
 
-Fase 1/2: leitura do diff de um PR (enviado ao LLM).
-Fase 3: postagem da review de volta no PR (comentários por linha), com fallback
-para comentário geral quando a linha não faz parte do diff.
+Reading: fetch the diff of a PR (sent to the LLM).
+Writing: post the review back to the PR (line comments), with a fallback to a
+general comment when a line is not part of the diff.
 """
 
 import logging
@@ -14,17 +14,17 @@ from .config import settings
 
 logger = logging.getLogger("pr_code_reviewer.github_client")
 
-# Captura o início da faixa do lado RIGHT no cabeçalho de hunk: "@@ -a,b +c,d @@".
+# Captures the start of the RIGHT-side range in a hunk header: "@@ -a,b +c,d @@".
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
 def valid_diff_lines(diff_text: str) -> dict[str, set[int]]:
-    """Mapeia cada arquivo -> conjunto de linhas do lado RIGHT presentes no diff.
+    """Map each file -> set of RIGHT-side line numbers present in the diff.
 
-    São as linhas adicionadas (`+`) ou de contexto (` `) — exatamente aquelas em
-    que a API do GitHub aceita comentários de review com `side="RIGHT"`. Usado
-    para decidir, antes de postar, quais comentários podem ser ancorados na linha
-    e quais precisam ir para o corpo da review.
+    These are the added (`+`) or context (` `) lines — exactly the ones on which
+    the GitHub API accepts review comments with `side="RIGHT"`. Used to decide,
+    before posting, which comments can be anchored to a line and which must go to
+    the review body.
     """
     result: dict[str, set[int]] = {}
     current_file: str | None = None
@@ -55,10 +55,10 @@ def valid_diff_lines(diff_text: str) -> dict[str, set[int]]:
             result[current_file].add(right_line)
             right_line += 1
         elif line.startswith("-") or line.startswith("\\"):
-            # `-` = lado LEFT (não avança RIGHT); `\` = "No newline at end of file".
+            # `-` = LEFT side (does not advance RIGHT); `\` = "No newline at EOF".
             continue
         else:
-            # Linha de contexto (começa com espaço ou está vazia).
+            # Context line (starts with a space or is empty).
             result[current_file].add(right_line)
             right_line += 1
 
@@ -66,10 +66,10 @@ def valid_diff_lines(diff_text: str) -> dict[str, set[int]]:
 
 
 def _headers(diff: bool = False) -> dict[str, str]:
-    """Monta os headers padrão para a API do GitHub.
+    """Build the standard headers for the GitHub API.
 
-    Se `diff=True`, pede o corpo no media type de diff unificado
-    (`application/vnd.github.v3.diff`); caso contrário, JSON padrão.
+    If `diff=True`, request the body in the unified-diff media type
+    (`application/vnd.github.v3.diff`); otherwise standard JSON.
     """
     accept = (
         "application/vnd.github.v3.diff" if diff else "application/vnd.github+json"
@@ -84,10 +84,10 @@ def _headers(diff: bool = False) -> dict[str, str]:
 
 
 async def get_pull_request_diff(owner: str, repo: str, pull_number: int) -> str:
-    """Retorna o diff unificado completo de um PR (texto no formato `.diff`).
+    """Return the full unified diff of a PR (text in `.diff` format).
 
-    Usa GET /repos/{owner}/{repo}/pulls/{pull_number} com o Accept de diff.
-    Ideal para enviar o patch inteiro ao LLM.
+    Uses GET /repos/{owner}/{repo}/pulls/{pull_number} with the diff Accept.
+    Ideal for sending the whole patch to the LLM.
     """
     url = f"{settings.GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pull_number}"
     async with httpx.AsyncClient(timeout=30) as client:
@@ -99,11 +99,11 @@ async def get_pull_request_diff(owner: str, repo: str, pull_number: int) -> str:
 async def get_pull_request_files(
     owner: str, repo: str, pull_number: int
 ) -> list[dict]:
-    """Lista os arquivos alterados no PR, com o `patch` de cada arquivo.
+    """List the files changed in the PR, with each file's `patch`.
 
-    Usa GET /repos/{owner}/{repo}/pulls/{pull_number}/files, seguindo a
-    paginação (100 por página). Útil quando quisermos comentar por arquivo/linha
-    em vez de enviar o diff inteiro.
+    Uses GET /repos/{owner}/{repo}/pulls/{pull_number}/files, following
+    pagination (100 per page). Useful when we want to comment per file/line
+    instead of sending the whole diff.
     """
     files: list[dict] = []
     url = f"{settings.GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pull_number}/files"
@@ -128,11 +128,11 @@ async def get_pull_request_files(
 async def get_pull_request_head_sha(
     owner: str, repo: str, pull_number: int
 ) -> str | None:
-    """Retorna o SHA do último commit do PR (campo `head.sha`).
+    """Return the SHA of the PR's latest commit (the `head.sha` field).
 
-    Necessário como `commit_id` no payload da review. Normalmente o SHA já vem
-    no payload do webhook (`pull_request.head.sha`); esta função serve como
-    fallback quando ele não está disponível. Retorna None em caso de erro.
+    Needed as `commit_id` in the review payload. Normally the SHA already comes
+    in the webhook payload (`pull_request.head.sha`); this function is a fallback
+    for when it is not available. Returns None on error.
     """
     url = f"{settings.GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pull_number}"
     try:
@@ -142,24 +142,24 @@ async def get_pull_request_head_sha(
             return resp.json().get("head", {}).get("sha")
     except Exception:
         logger.exception(
-            "Falha ao buscar o head.sha do PR #%s (%s/%s).", pull_number, owner, repo
+            "Failed to fetch head.sha of PR #%s (%s/%s).", pull_number, owner, repo
         )
         return None
 
 
 def _build_body(header: str, overflow: list[str] | None) -> str:
-    """Monta o corpo da review: cabeçalho + (opcional) seção de comentários que
-    não puderam ser ancorados em linhas do diff."""
+    """Build the review body: header + (optional) section for comments that
+    could not be anchored to diff lines."""
     if not overflow:
         return header
-    linhas = [
+    lines = [
         header,
         "",
-        "> ⚠️ Comentários que não puderam ser ancorados em linhas do diff:",
+        "> ⚠️ Comments that could not be anchored to diff lines:",
         "",
     ]
-    linhas.extend(overflow)
-    return "\n".join(linhas)
+    lines.extend(overflow)
+    return "\n".join(lines)
 
 
 async def _submit_review_fallback(
@@ -171,34 +171,34 @@ async def _submit_review_fallback(
     header: str,
     overflow: list[str] | None,
 ) -> dict:
-    """Rede de segurança: se até os comentários já validados forem rejeitados,
-    posta uma review geral única, movendo TODOS eles para o corpo (sem âncora de
-    linha) — nada é descartado.
+    """Safety net: if even the already-validated line comments get rejected,
+    post a single general review moving ALL of them to the body (no line
+    anchor) — nothing is discarded.
     """
-    todos = list(overflow or [])
+    all_lines = list(overflow or [])
     for c in comments:
-        todos.append(f"- **{c.get('path')}** (linha {c.get('line')}): {c.get('body')}")
+        all_lines.append(f"- **{c.get('path')}** (line {c.get('line')}): {c.get('body')}")
 
-    payload: dict = {"body": _build_body(header, todos), "event": "COMMENT"}
+    payload: dict = {"body": _build_body(header, all_lines), "event": "COMMENT"}
     if commit_id:
         payload["commit_id"] = commit_id
 
     try:
         resp = await client.post(url, headers=_headers(), json=payload)
     except Exception:
-        logger.exception("Falha na requisição de fallback da review (PR #%s).", pull_number)
+        logger.exception("Fallback review request failed (PR #%s).", pull_number)
         return {"ok": False, "fallback": True}
 
     if resp.status_code in (200, 201):
         logger.info(
-            "Fallback: review geral postada no PR #%s com %d comentário(s) no corpo.",
+            "Fallback: general review posted on PR #%s with %d comment(s) in the body.",
             pull_number,
-            len(todos),
+            len(all_lines),
         )
-        return {"ok": True, "fallback": True, "posted_line_comments": 0, "in_body": len(todos)}
+        return {"ok": True, "fallback": True, "posted_line_comments": 0, "in_body": len(all_lines)}
 
     logger.error(
-        "Fallback também falhou no PR #%s (HTTP %s): %s",
+        "Fallback also failed on PR #%s (HTTP %s): %s",
         pull_number,
         resp.status_code,
         resp.text[:500],
@@ -212,21 +212,21 @@ async def submit_pr_review(
     pull_number: int,
     comments: list[dict],
     commit_id: str | None,
-    body: str = "🤖 Revisão automática de código",
+    body: str = "🤖 Automated code review",
     event: str = "COMMENT",
     overflow: list[str] | None = None,
 ) -> dict:
-    """Posta uma review no PR via POST /repos/{owner}/{repo}/pulls/{n}/reviews.
+    """Post a review on the PR via POST /repos/{owner}/{repo}/pulls/{n}/reviews.
 
-    `comments` deve estar no formato da API do GitHub, JÁ validados contra o diff
-    pelo chamador (ver `valid_diff_lines`):
-        {"path": "arquivo.py", "line": 42, "side": "RIGHT", "body": "..."}
-    `overflow` é uma lista de linhas markdown pré-formatadas de comentários que
-    não puderam ser ancorados (arquivo/linha fora do diff) — vão para o corpo.
+    `comments` must be in the GitHub API format, ALREADY validated against the
+    diff by the caller (see `valid_diff_lines`):
+        {"path": "file.py", "line": 42, "side": "RIGHT", "body": "..."}
+    `overflow` is a list of pre-formatted markdown lines for comments that could
+    not be anchored (file/line outside the diff) — they go to the body.
 
-    Usa event="COMMENT" (o bot só comenta; não aprova nem bloqueia). Como os
-    comentários de linha já vêm validados, um 422 é raro; se ainda assim
-    acontecer, o fallback move tudo para o corpo. Nunca levanta exceção.
+    Uses event="COMMENT" (the bot only comments; it neither approves nor blocks).
+    Since the line comments are already validated, a 422 is rare; if it still
+    happens, the fallback moves everything to the body. Never raises.
     """
     url = f"{settings.GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pull_number}/reviews"
 
@@ -240,12 +240,12 @@ async def submit_pr_review(
         try:
             resp = await client.post(url, headers=_headers(), json=payload)
         except Exception:
-            logger.exception("Falha na requisição da review do PR #%s.", pull_number)
+            logger.exception("Review request failed for PR #%s.", pull_number)
             return {"ok": False}
 
         if resp.status_code in (200, 201):
             logger.info(
-                "Review postada no PR #%s (%d comentário(s) de linha, %d no corpo, "
+                "Review posted on PR #%s (%d line comment(s), %d in the body, "
                 "event=%s).",
                 pull_number,
                 len(comments),
@@ -260,13 +260,13 @@ async def submit_pr_review(
             }
 
         logger.error(
-            "GitHub rejeitou a review do PR #%s (HTTP %s): %s",
+            "GitHub rejected the review of PR #%s (HTTP %s): %s",
             pull_number,
             resp.status_code,
             resp.text[:500],
         )
 
-        # Rede de segurança: move tudo para o corpo se houver comentários de linha.
+        # Safety net: move everything to the body if there are line comments.
         if comments:
             return await _submit_review_fallback(
                 client, url, pull_number, comments, commit_id, body, overflow

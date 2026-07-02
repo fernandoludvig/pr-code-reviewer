@@ -1,10 +1,10 @@
-"""Rota que recebe e valida os eventos de webhook do GitHub.
+"""Route that receives and validates GitHub webhook events.
 
-Fase 1: valida a assinatura HMAC e filtra eventos `pull_request` relevantes
-(opened / synchronize / reopened).
-Fase 2: para esses eventos, busca o diff real do PR e chama o revisor via LLM.
-Fase 3: mapeia os comentários gerados para o formato da API do GitHub e posta
-uma review (event=COMMENT) de volta no PR. Tudo em background.
+- Validates the HMAC signature and filters relevant `pull_request` events
+  (opened / synchronize / reopened).
+- For those events, fetches the real PR diff and runs the LLM reviewer.
+- Maps the generated comments to the GitHub API format and posts a review
+  (event=COMMENT) back to the PR. All in the background.
 """
 
 import asyncio
@@ -22,113 +22,114 @@ logger = logging.getLogger("pr_code_reviewer.webhook")
 
 router = APIRouter()
 
-# Ações de pull_request que nos interessam nesta fase.
+# pull_request actions we care about.
 RELEVANT_ACTIONS = {"opened", "synchronize", "reopened"}
 
-# Cache em memória de commits já revisados (head.sha), para não reprocessar o
-# mesmo evento em pushes rápidos e gastar chamadas ao LLM à toa. Reseta ao
-# reiniciar o servidor (aceitável para portfólio; ver README > Limitações).
+# In-memory cache of already-reviewed commits (head.sha), so we don't reprocess
+# the same event on rapid pushes and waste LLM calls. Reset on server restart
+# (acceptable for a portfolio; see README > Known limitations).
 _processed_commits = TTLCache(ttl_seconds=3600)
 
-# Emoji por severidade, usado no corpo de cada comentário postado no PR.
-SEVERIDADE_EMOJI = {"alta": "🔴", "media": "🟡", "baixa": "🟢"}
+# Emoji per severity, used in the body of each comment posted on the PR.
+SEVERITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 
-# Ordem de severidade para comparação (baixa < media < alta).
-SEVERIDADE_ORDEM = {"baixa": 0, "media": 1, "alta": 2}
+# Severity ordering for comparison (low < medium < high).
+SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
-def _filter_by_severity(comentarios: list[dict], min_severity: str) -> list[dict]:
-    """Mantém apenas comentários com severidade >= min_severity.
+def _filter_by_severity(comments: list[dict], min_severity: str) -> list[dict]:
+    """Keep only comments with severity >= min_severity.
 
-    Severidade desconhecida é tratada como a mais baixa (0). Um min_severity
-    inválido cai para "media".
+    An unknown severity is treated as the lowest (0). An invalid min_severity
+    falls back to "medium".
     """
-    min_rank = SEVERIDADE_ORDEM.get(
-        (min_severity or "").lower(), SEVERIDADE_ORDEM["media"]
+    min_rank = SEVERITY_ORDER.get(
+        (min_severity or "").lower(), SEVERITY_ORDER["medium"]
     )
     return [
         c
-        for c in comentarios
-        if SEVERIDADE_ORDEM.get(c.get("severidade"), 0) >= min_rank
+        for c in comments
+        if SEVERITY_ORDER.get(c.get("severity"), 0) >= min_rank
     ]
 
 
-def _dedupe_comments(comentarios: list[dict]) -> list[dict]:
-    """Remove comentários duplicados na mesma (arquivo, linha aproximada).
+def _dedupe_comments(comments: list[dict]) -> list[dict]:
+    """Remove duplicate comments on the same (file, approximate line).
 
-    O LLM às vezes gera dois comentários para o mesmo ponto com textos um pouco
-    diferentes. Heurística simples: se caírem na mesma (arquivo, linha), mantém
-    apenas o de MAIOR severidade e descarta o outro. Preserva a ordem original.
+    The LLM sometimes generates two comments for the same spot with slightly
+    different text. Simple heuristic: if they fall on the same (file, line),
+    keep only the one with the HIGHEST severity and drop the other. Preserves
+    the original order.
     """
-    melhor: dict[tuple, dict] = {}
-    for c in comentarios:
-        chave = (c.get("arquivo"), c.get("linha_aproximada"))
-        atual = melhor.get(chave)
-        if atual is None or SEVERIDADE_ORDEM.get(
-            c.get("severidade"), 0
-        ) > SEVERIDADE_ORDEM.get(atual.get("severidade"), 0):
-            melhor[chave] = c
-    return list(melhor.values())
+    best: dict[tuple, dict] = {}
+    for c in comments:
+        key = (c.get("file"), c.get("line"))
+        current = best.get(key)
+        if current is None or SEVERITY_ORDER.get(
+            c.get("severity"), 0
+        ) > SEVERITY_ORDER.get(current.get("severity"), 0):
+            best[key] = c
+    return list(best.values())
 
 
 def _split_comments(
-    comentarios: list[dict], valid_lines: dict[str, set[int]]
+    comments: list[dict], valid_lines: dict[str, set[int]]
 ) -> tuple[list[dict], list[str]]:
-    """Separa os comentários do LLM em ancoráveis × overflow.
+    """Split the LLM comments into anchorable vs. overflow.
 
-    Retorna (ancorados, overflow):
-    - ancorados: comentários no formato da API do GitHub cujo (arquivo, linha)
-      existe no diff (`side="RIGHT"`) — postados na linha.
-    - overflow: linhas markdown pré-formatadas dos comentários que NÃO podem ser
-      ancorados (sem arquivo/linha, ou linha fora do diff) — vão para o corpo,
-      em vez de serem descartados.
+    Returns (anchored, overflow):
+    - anchored: comments in the GitHub API format whose (file, line) exists in
+      the diff (`side="RIGHT"`) — posted on the line.
+    - overflow: pre-formatted markdown lines for comments that CANNOT be
+      anchored (missing file/line, or a line outside the diff) — they go to the
+      body instead of being discarded.
     """
-    ancorados: list[dict] = []
+    anchored: list[dict] = []
     overflow: list[str] = []
-    for c in comentarios:
-        severidade = c.get("severidade", "baixa")
-        emoji = SEVERIDADE_EMOJI.get(severidade, "⚪")
-        texto = c.get("comentario", "")
-        path = c.get("arquivo")
-        linha = c.get("linha_aproximada")
+    for c in comments:
+        severity = c.get("severity", "low")
+        emoji = SEVERITY_EMOJI.get(severity, "⚪")
+        text = c.get("comment", "")
+        path = c.get("file")
+        raw_line = c.get("line")
 
         line: int | None = None
-        if path and linha is not None:
+        if path and raw_line is not None:
             try:
-                line = int(linha)
+                line = int(raw_line)
             except (TypeError, ValueError):
                 line = None
 
         if line is not None and line in valid_lines.get(path, set()):
-            ancorados.append(
+            anchored.append(
                 {
                     "path": path,
                     "line": line,
                     "side": "RIGHT",
-                    "body": f"{emoji} **[{severidade}]** {texto}",
+                    "body": f"{emoji} **[{severity}]** {text}",
                 }
             )
         else:
-            overflow.append(f"- {emoji} **[{severidade}]** {path}:{linha} — {texto}")
-    return ancorados, overflow
+            overflow.append(f"- {emoji} **[{severity}]** {path}:{raw_line} — {text}")
+    return anchored, overflow
 
 
 async def process_pull_request(
     owner: str, repo: str, pull_number: int, pr_title: str, head_sha: str | None = None
 ) -> None:
-    """Busca o diff, roda a revisão via LLM e posta a review (em background).
+    """Fetch the diff, run the LLM review and post the review (in background).
 
-    Roda DEPOIS da resposta 200 já ter sido enviada ao GitHub, então pode
-    demorar o quanto for sem estourar o timeout do webhook. Nunca levanta
-    exceção para fora: qualquer erro é logado.
+    Runs AFTER the 200 response has already been sent to GitHub, so it can take
+    as long as needed without hitting the webhook timeout. Never raises to the
+    caller: any error is logged.
     """
-    # Deduplicação de evento: se este commit (head.sha) já foi revisado
-    # recentemente, pula — evita gasto duplicado de tokens em pushes rápidos.
+    # Event dedup: if this commit (head.sha) was reviewed recently, skip it —
+    # avoids duplicate token spend on rapid pushes.
     if head_sha:
-        chave = f"{owner}/{repo}#{pull_number}@{head_sha}"
-        if _processed_commits.seen(chave):
+        key = f"{owner}/{repo}#{pull_number}@{head_sha}"
+        if _processed_commits.seen(key):
             logger.info(
-                "PR #%s: commit %s já revisado, ignorando.",
+                "PR #%s: commit %s already reviewed, skipping.",
                 pull_number,
                 head_sha[:8],
             )
@@ -138,120 +139,119 @@ async def process_pull_request(
         diff = await github_client.get_pull_request_diff(owner, repo, pull_number)
     except Exception:
         logger.exception(
-            "Falha ao buscar o diff do PR #%s (%s/%s).", pull_number, owner, repo
+            "Failed to fetch the diff of PR #%s (%s/%s).", pull_number, owner, repo
         )
         return
 
     logger.info(
-        "Diff do PR #%s obtido (%d caracteres). Iniciando revisão via LLM...",
+        "Diff of PR #%s fetched (%d chars). Starting LLM review...",
         pull_number,
         len(diff),
     )
 
-    # review_diff é síncrono (cliente da OpenAI bloqueante); rodamos numa thread
-    # para não bloquear o event loop do FastAPI.
-    comentarios = await asyncio.to_thread(llm_reviewer.review_diff, diff, pr_title)
+    # review_diff is synchronous (blocking OpenAI client); run it in a thread so
+    # we don't block the FastAPI event loop.
+    comments = await asyncio.to_thread(llm_reviewer.review_diff, diff, pr_title)
 
-    # Filtro por severidade mínima (config MIN_SEVERITY).
-    total_bruto = len(comentarios)
-    comentarios = _filter_by_severity(comentarios, settings.MIN_SEVERITY)
-    if total_bruto != len(comentarios):
+    # Minimum-severity filter (MIN_SEVERITY config).
+    raw_total = len(comments)
+    comments = _filter_by_severity(comments, settings.MIN_SEVERITY)
+    if raw_total != len(comments):
         logger.info(
-            "PR #%s: filtro de severidade (>= %s) manteve %d de %d comentário(s).",
+            "PR #%s: severity filter (>= %s) kept %d of %d comment(s).",
             pull_number,
             settings.MIN_SEVERITY,
-            len(comentarios),
-            total_bruto,
+            len(comments),
+            raw_total,
         )
 
-    # Deduplicação por (arquivo, linha), mantendo a maior severidade.
-    antes_dedupe = len(comentarios)
-    comentarios = _dedupe_comments(comentarios)
-    if antes_dedupe != len(comentarios):
+    # Deduplication by (file, line), keeping the highest severity.
+    before_dedupe = len(comments)
+    comments = _dedupe_comments(comments)
+    if before_dedupe != len(comments):
         logger.info(
-            "PR #%s: deduplicação removeu %d comentário(s) na mesma linha.",
+            "PR #%s: deduplication removed %d comment(s) on the same line.",
             pull_number,
-            antes_dedupe - len(comentarios),
+            before_dedupe - len(comments),
         )
 
-    # commit_id necessário para ancorar os comentários de linha. Prefere o SHA
-    # que já veio no webhook; se faltar, busca via API.
+    # commit_id is needed to anchor the line comments. Prefer the SHA that came
+    # in the webhook; if missing, fetch it via the API.
     commit_id = head_sha or await github_client.get_pull_request_head_sha(
         owner, repo, pull_number
     )
 
-    # Caso 1: nenhum problema encontrado → review positiva simples, sem linhas.
-    if not comentarios:
-        logger.info("Revisão do PR #%s: nenhum comentário gerado.", pull_number)
-        resultado = await github_client.submit_pr_review(
+    # Case 1: no problems found → simple positive review, no line comments.
+    if not comments:
+        logger.info("Review of PR #%s: no comments generated.", pull_number)
+        result = await github_client.submit_pr_review(
             owner,
             repo,
             pull_number,
             comments=[],
             commit_id=commit_id,
-            body="✅ Revisão automática: nenhum problema crítico encontrado.",
+            body="✅ Automated review: no critical issues found.",
         )
-        logger.info("Postagem da review (PR #%s): %s", pull_number, resultado)
+        logger.info("Review posting (PR #%s): %s", pull_number, result)
         return
 
-    # Caso 2: há comentários → loga cada um e posta a review.
+    # Case 2: there are comments → log each one and post the review.
     logger.info(
-        "Revisão do PR #%s: %d comentário(s) gerado(s):", pull_number, len(comentarios)
+        "Review of PR #%s: %d comment(s) generated:", pull_number, len(comments)
     )
-    for i, c in enumerate(comentarios, start=1):
+    for i, c in enumerate(comments, start=1):
         logger.info(
-            "  [%d] %s:%s | severidade=%s | %s",
+            "  [%d] %s:%s | severity=%s | %s",
             i,
-            c.get("arquivo"),
-            c.get("linha_aproximada"),
-            c.get("severidade"),
-            c.get("comentario"),
+            c.get("file"),
+            c.get("line"),
+            c.get("severity"),
+            c.get("comment"),
         )
 
-    # Separa, com base no diff, quem pode ser ancorado na linha (ancorados) e
-    # quem precisa ir para o corpo (overflow). Os que a API aceitaria como
-    # comentário de linha ficam ancorados; só os inválidos viram texto no corpo.
+    # Based on the diff, split which comments can be anchored to a line
+    # (anchored) and which must go to the body (overflow). The ones the API
+    # would accept as line comments stay anchored; only the invalid ones become
+    # body text.
     valid_lines = github_client.valid_diff_lines(diff)
-    ancorados, overflow = _split_comments(comentarios, valid_lines)
+    anchored, overflow = _split_comments(comments, valid_lines)
     if overflow:
         logger.info(
-            "PR #%s: %d comentário(s) ancorado(s) na linha, %d movido(s) para o "
-            "corpo (linha fora do diff).",
+            "PR #%s: %d comment(s) anchored to a line, %d moved to the body "
+            "(line outside the diff).",
             pull_number,
-            len(ancorados),
+            len(anchored),
             len(overflow),
         )
 
-    resultado = await github_client.submit_pr_review(
+    result = await github_client.submit_pr_review(
         owner,
         repo,
         pull_number,
-        comments=ancorados,
+        comments=anchored,
         commit_id=commit_id,
         overflow=overflow,
     )
-    logger.info("Postagem da review (PR #%s): %s", pull_number, resultado)
+    logger.info("Review posting (PR #%s): %s", pull_number, result)
 
 
 def verify_signature(payload_body: bytes, signature_header: str | None) -> None:
-    """Valida a assinatura HMAC-SHA256 enviada pelo GitHub.
+    """Validate the HMAC-SHA256 signature sent by GitHub.
 
-    O GitHub assina o corpo bruto da requisição com o `GITHUB_WEBHOOK_SECRET`
-    e envia o resultado no header `X-Hub-Signature-256` no formato
-    `sha256=<hexdigest>`. Recalculamos e comparamos de forma segura contra
-    ataques de timing.
+    GitHub signs the raw request body with `GITHUB_WEBHOOK_SECRET` and sends the
+    result in the `X-Hub-Signature-256` header as `sha256=<hexdigest>`. We
+    recompute it and compare in a timing-safe way.
 
-    Levanta HTTPException se a configuração estiver ausente ou a assinatura
-    for inválida.
+    Raises HTTPException if the config is missing or the signature is invalid.
     """
     if not settings.GITHUB_WEBHOOK_SECRET:
-        # Sem segredo configurado não há como validar — falha fechada.
-        logger.error("GITHUB_WEBHOOK_SECRET não configurado; recusando webhook.")
-        raise HTTPException(status_code=500, detail="Webhook secret não configurado")
+        # Without a configured secret we cannot validate — fail closed.
+        logger.error("GITHUB_WEBHOOK_SECRET not configured; refusing webhook.")
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
     if not signature_header:
         raise HTTPException(
-            status_code=401, detail="Header X-Hub-Signature-256 ausente"
+            status_code=401, detail="Missing X-Hub-Signature-256 header"
         )
 
     expected = "sha256=" + hmac.new(
@@ -261,7 +261,7 @@ def verify_signature(payload_body: bytes, signature_header: str | None) -> None:
     ).hexdigest()
 
     if not hmac.compare_digest(expected, signature_header):
-        raise HTTPException(status_code=401, detail="Assinatura inválida")
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
 
 @router.post("/webhook/github")
@@ -271,31 +271,31 @@ async def github_webhook(
     x_github_event: str | None = Header(default=None),
     x_hub_signature_256: str | None = Header(default=None),
 ):
-    """Recebe eventos do GitHub Webhook.
+    """Receive GitHub Webhook events.
 
-    Retorna 200 rapidamente (o GitHub espera resposta em poucos segundos). O
-    trabalho pesado (buscar o diff + revisão via LLM) é agendado em background
-    para não bloquear a resposta ao GitHub.
+    Returns 200 quickly (GitHub expects a response within a few seconds). The
+    heavy work (fetching the diff + LLM review) is scheduled in the background so
+    it does not block the response to GitHub.
     """
-    # Importante: assinar o corpo BRUTO, antes de qualquer parse de JSON.
+    # Important: sign the RAW body, before any JSON parsing.
     body = await request.body()
     verify_signature(body, x_hub_signature_256)
 
     payload = await request.json()
 
-    # Evento de teste disparado ao criar o webhook no GitHub.
+    # Test event fired when the webhook is created on GitHub.
     if x_github_event == "ping":
-        logger.info("Ping recebido do GitHub webhook.")
+        logger.info("Ping received from the GitHub webhook.")
         return {"msg": "pong"}
 
     if x_github_event != "pull_request":
-        logger.info("Evento ignorado: %s", x_github_event)
-        return {"msg": f"evento '{x_github_event}' ignorado"}
+        logger.info("Event ignored: %s", x_github_event)
+        return {"msg": f"event '{x_github_event}' ignored"}
 
     action = payload.get("action")
     if action not in RELEVANT_ACTIONS:
-        logger.info("Ação de pull_request ignorada: %s", action)
-        return {"msg": f"ação '{action}' ignorada"}
+        logger.info("pull_request action ignored: %s", action)
+        return {"msg": f"action '{action}' ignored"}
 
     pr = payload.get("pull_request", {})
     repo = payload.get("repository", {})
@@ -307,7 +307,7 @@ async def github_webhook(
     head_sha = pr.get("head", {}).get("sha")
 
     logger.info(
-        "PR #%s | ação=%s | repo=%s | autor=%s | título=%s",
+        "PR #%s | action=%s | repo=%s | author=%s | title=%s",
         number,
         action,
         repo.get("full_name"),
@@ -315,14 +315,14 @@ async def github_webhook(
         title,
     )
 
-    # Agenda a busca do diff + revisão via LLM + postagem para depois do 200.
+    # Schedule the diff fetch + LLM review + posting for after the 200 response.
     if owner and repo_name and number is not None:
         background_tasks.add_task(
             process_pull_request, owner, repo_name, number, title or "", head_sha
         )
     else:
         logger.warning(
-            "Payload sem owner/repo/number suficientes; revisão não agendada."
+            "Payload without enough owner/repo/number; review not scheduled."
         )
 
     return {"msg": "ok", "pr": number, "action": action}

@@ -1,19 +1,19 @@
-"""Cache simples em memória para evitar reprocessar o mesmo commit de um PR.
+"""Simple in-memory cache to avoid reprocessing the same commit of a PR.
 
-⚠️ Este cache é APENAS em memória (um dict no processo) e é resetado se o
-servidor reiniciar. É suficiente para o escopo de portfólio; em produção real
-seria substituído por Redis ou um banco de dados compartilhado entre instâncias.
+⚠️ This cache is IN-MEMORY ONLY (a dict in the process) and is reset when the
+server restarts. It is enough for a portfolio scope; in real production it would
+be replaced by Redis or a database shared across instances.
 """
 
 import time
 
 
 class TTLCache:
-    """Cache de chaves com expiração por tempo (TTL).
+    """Key cache with time-based expiration (TTL).
 
-    Uso típico: `seen(key)` faz check-and-set atômico (sob o GIL, sem await
-    interno) — retorna True se a chave JÁ tinha sido vista dentro do TTL; caso
-    contrário, registra a chave e retorna False.
+    Typical use: `seen(key)` does an atomic check-and-set (under the GIL, no
+    internal await) — returns True if the key was ALREADY seen within the TTL;
+    otherwise it records the key and returns False.
     """
 
     def __init__(self, ttl_seconds: int = 3600) -> None:
@@ -21,14 +21,14 @@ class TTLCache:
         self._store: dict[str, float] = {}
 
     def _purge(self, now: float) -> None:
-        expirados = [k for k, t in self._store.items() if now - t > self._ttl]
-        for k in expirados:
+        expired = [k for k, t in self._store.items() if now - t > self._ttl]
+        for k in expired:
             del self._store[k]
 
     def seen(self, key: str) -> bool:
-        """Retorna True se a chave já foi vista (e ainda dentro do TTL).
+        """Return True if the key was already seen (and still within the TTL).
 
-        Se não foi vista, registra o timestamp atual e retorna False.
+        If it was not seen, record the current timestamp and return False.
         """
         now = time.monotonic()
         self._purge(now)
