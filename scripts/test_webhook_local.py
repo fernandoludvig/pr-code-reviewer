@@ -1,19 +1,23 @@
 """Teste local do fluxo do webhook — com dois modos.
 
 MODO SEGURO (padrão, POST_TO_GITHUB = False):
-    Roda o fluxo completo OFFLINE: HMAC + filtro + BackgroundTasks + review via
-    LLM (chamada real à OpenAI), mas SEM tocar no GitHub. A busca do diff é
-    mockada e a postagem da review é interceptada e apenas IMPRESSA — mostra
-    exatamente o payload que seria enviado ao GitHub.
+    1) Checagens DETERMINÍSTICAS (sem custo): filtro por severidade, deduplicação
+       e split ancorado/overflow.
+    2) Fluxo completo do webhook OFFLINE (HMAC + BackgroundTasks + review via LLM
+       real), com a busca do diff mockada e a postagem interceptada/impressa.
+    3) Reenvia o MESMO evento (mesmo head.sha) para mostrar a deduplicação de
+       evento (o segundo é ignorado, sem gastar tokens).
 
 MODO REAL (POST_TO_GITHUB = True):
     ⚠️ Posta comentários DE VERDADE num PR real. Ajuste REAL_OWNER/REAL_REPO/
-    REAL_PR_NUMBER para o seu PR de teste. Busca o diff real, roda a revisão e
-    chama submit_pr_review() sem mocks.
+    REAL_PR_NUMBER. Busca o diff real, roda a revisão e posta sem mocks.
 
 Uso:
     source .venv/bin/activate
     python scripts/test_webhook_local.py
+
+    # testar outra severidade mínima:
+    MIN_SEVERITY=alta python scripts/test_webhook_local.py
 """
 
 import asyncio
@@ -57,6 +61,40 @@ FAKE_DIFF = '''diff --git a/api/users.py b/api/users.py
 '''
 
 
+def demo_helpers() -> None:
+    """Checagens determinísticas das melhorias da Fase 4 (sem LLM, sem GitHub)."""
+    sample = [
+        {"arquivo": "api/users.py", "linha_aproximada": 1, "severidade": "alta", "comentario": "senha hardcoded"},
+        {"arquivo": "api/users.py", "linha_aproximada": 1, "severidade": "baixa", "comentario": "mesmo ponto, dup"},
+        {"arquivo": "api/users.py", "linha_aproximada": 4, "severidade": "media", "comentario": "sql injection"},
+        {"arquivo": "api/users.py", "linha_aproximada": 50, "severidade": "baixa", "comentario": "nitpick de estilo"},
+        {"arquivo": "api/users.py", "linha_aproximada": 999, "severidade": "alta", "comentario": "linha fora do diff"},
+    ]
+    filt = webhook._filter_by_severity(sample, "media")
+    print(f"  filtro (>= media):  {len(sample)} -> {len(filt)}  (remove as 'baixa')")
+    ded = webhook._dedupe_comments(filt)
+    print(f"  deduplicação:       {len(filt)} -> {len(ded)}  (junta os da mesma linha)")
+    anc, ovf = webhook._split_comments(ded, github_client.valid_diff_lines(FAKE_DIFF))
+    print(f"  split ancora/corpo: {len(anc)} ancorado(s), {len(ovf)} no corpo (linha 999 fora do diff)")
+
+
+def _post_event(client: TestClient, payload: dict) -> None:
+    body = json.dumps(payload).encode("utf-8")
+    signature = "sha256=" + hmac.new(
+        settings.GITHUB_WEBHOOK_SECRET.encode(), body, hashlib.sha256
+    ).hexdigest()
+    resp = client.post(
+        "/webhook/github",
+        content=body,
+        headers={
+            "X-GitHub-Event": "pull_request",
+            "X-Hub-Signature-256": signature,
+            "Content-Type": "application/json",
+        },
+    )
+    print(f"HTTP {resp.status_code} -> {resp.json()}")
+
+
 def run_safe_mode() -> None:
     """Fluxo completo offline; a postagem no GitHub é apenas simulada/impressa."""
     payload = {
@@ -73,10 +111,6 @@ def run_safe_mode() -> None:
             "owner": {"login": "fernandoludvig"},
         },
     }
-    body = json.dumps(payload).encode("utf-8")
-    signature = "sha256=" + hmac.new(
-        settings.GITHUB_WEBHOOK_SECRET.encode(), body, hashlib.sha256
-    ).hexdigest()
 
     async def fake_get_diff(owner, repo, pull_number):
         print(f"[mock] get_pull_request_diff({owner}, {repo}, {pull_number})")
@@ -87,25 +121,22 @@ def run_safe_mode() -> None:
         print(json.dumps(
             {"commit_id": commit_id, "event": kw.get("event", "COMMENT"),
              "body": kw.get("body", "🤖 Revisão automática de código"),
-             "comments": comments},
+             "overflow": kw.get("overflow"), "comments": comments},
             indent=2, ensure_ascii=False,
         ))
-        print("======================================================\n")
+        print("======================================================")
         return {"ok": True, "fallback": False, "posted_line_comments": len(comments)}
+
+    print("--- 1) Checagens determinísticas (filtro / dedupe / split) ---")
+    demo_helpers()
 
     with patch.object(github_client, "get_pull_request_diff", fake_get_diff), \
          patch.object(github_client, "submit_pr_review", fake_submit_review):
         client = TestClient(app)
-        resp = client.post(
-            "/webhook/github",
-            content=body,
-            headers={
-                "X-GitHub-Event": "pull_request",
-                "X-Hub-Signature-256": signature,
-                "Content-Type": "application/json",
-            },
-        )
-        print(f"HTTP {resp.status_code} -> {resp.json()}")
+        print("\n--- 2) Fluxo completo do webhook (LLM real) ---")
+        _post_event(client, payload)
+        print("\n--- 3) MESMO evento de novo (head.sha repetido) deve ser ignorado ---")
+        _post_event(client, payload)
 
 
 def run_real_mode() -> None:

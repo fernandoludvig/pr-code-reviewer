@@ -32,5 +32,9 @@ class Settings:
     # Modelo usado na revisão. gpt-4o-mini pelo bom custo-benefício.
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+    # Severidade mínima para um comentário ser postado no PR.
+    # Valores: "baixa" < "media" < "alta". Padrão: "media".
+    MIN_SEVERITY: str = os.getenv("MIN_SEVERITY", "media")
+
 
 settings = Settings()

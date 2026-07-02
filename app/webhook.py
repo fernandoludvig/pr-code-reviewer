@@ -16,6 +16,7 @@ from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 
 from . import github_client, llm_reviewer
 from .config import settings
+from .dedup_cache import TTLCache
 
 logger = logging.getLogger("pr_code_reviewer.webhook")
 
@@ -24,31 +25,92 @@ router = APIRouter()
 # Ações de pull_request que nos interessam nesta fase.
 RELEVANT_ACTIONS = {"opened", "synchronize", "reopened"}
 
+# Cache em memória de commits já revisados (head.sha), para não reprocessar o
+# mesmo evento em pushes rápidos e gastar chamadas ao LLM à toa. Reseta ao
+# reiniciar o servidor (aceitável para portfólio; ver README > Limitações).
+_processed_commits = TTLCache(ttl_seconds=3600)
+
 # Emoji por severidade, usado no corpo de cada comentário postado no PR.
 SEVERIDADE_EMOJI = {"alta": "🔴", "media": "🟡", "baixa": "🟢"}
 
+# Ordem de severidade para comparação (baixa < media < alta).
+SEVERIDADE_ORDEM = {"baixa": 0, "media": 1, "alta": 2}
 
-def _to_github_comments(comentarios: list[dict]) -> list[dict]:
-    """Converte os comentários do LLM para o formato da API de reviews do GitHub.
 
-    Formata o corpo com o emoji de severidade + o texto. Descarta itens sem
-    arquivo/linha válidos (não dá para ancorar em linha), que serão apenas
-    logados.
+def _filter_by_severity(comentarios: list[dict], min_severity: str) -> list[dict]:
+    """Mantém apenas comentários com severidade >= min_severity.
+
+    Severidade desconhecida é tratada como a mais baixa (0). Um min_severity
+    inválido cai para "media".
     """
-    gh_comments: list[dict] = []
+    min_rank = SEVERIDADE_ORDEM.get(
+        (min_severity or "").lower(), SEVERIDADE_ORDEM["media"]
+    )
+    return [
+        c
+        for c in comentarios
+        if SEVERIDADE_ORDEM.get(c.get("severidade"), 0) >= min_rank
+    ]
+
+
+def _dedupe_comments(comentarios: list[dict]) -> list[dict]:
+    """Remove comentários duplicados na mesma (arquivo, linha aproximada).
+
+    O LLM às vezes gera dois comentários para o mesmo ponto com textos um pouco
+    diferentes. Heurística simples: se caírem na mesma (arquivo, linha), mantém
+    apenas o de MAIOR severidade e descarta o outro. Preserva a ordem original.
+    """
+    melhor: dict[tuple, dict] = {}
     for c in comentarios:
+        chave = (c.get("arquivo"), c.get("linha_aproximada"))
+        atual = melhor.get(chave)
+        if atual is None or SEVERIDADE_ORDEM.get(
+            c.get("severidade"), 0
+        ) > SEVERIDADE_ORDEM.get(atual.get("severidade"), 0):
+            melhor[chave] = c
+    return list(melhor.values())
+
+
+def _split_comments(
+    comentarios: list[dict], valid_lines: dict[str, set[int]]
+) -> tuple[list[dict], list[str]]:
+    """Separa os comentários do LLM em ancoráveis × overflow.
+
+    Retorna (ancorados, overflow):
+    - ancorados: comentários no formato da API do GitHub cujo (arquivo, linha)
+      existe no diff (`side="RIGHT"`) — postados na linha.
+    - overflow: linhas markdown pré-formatadas dos comentários que NÃO podem ser
+      ancorados (sem arquivo/linha, ou linha fora do diff) — vão para o corpo,
+      em vez de serem descartados.
+    """
+    ancorados: list[dict] = []
+    overflow: list[str] = []
+    for c in comentarios:
+        severidade = c.get("severidade", "baixa")
+        emoji = SEVERIDADE_EMOJI.get(severidade, "⚪")
+        texto = c.get("comentario", "")
         path = c.get("arquivo")
         linha = c.get("linha_aproximada")
-        if not path or linha is None:
-            continue
-        try:
-            line = int(linha)
-        except (TypeError, ValueError):
-            continue
-        emoji = SEVERIDADE_EMOJI.get(c.get("severidade"), "⚪")
-        corpo = f"{emoji} **[{c.get('severidade', 'baixa')}]** {c.get('comentario', '')}"
-        gh_comments.append({"path": path, "line": line, "side": "RIGHT", "body": corpo})
-    return gh_comments
+
+        line: int | None = None
+        if path and linha is not None:
+            try:
+                line = int(linha)
+            except (TypeError, ValueError):
+                line = None
+
+        if line is not None and line in valid_lines.get(path, set()):
+            ancorados.append(
+                {
+                    "path": path,
+                    "line": line,
+                    "side": "RIGHT",
+                    "body": f"{emoji} **[{severidade}]** {texto}",
+                }
+            )
+        else:
+            overflow.append(f"- {emoji} **[{severidade}]** {path}:{linha} — {texto}")
+    return ancorados, overflow
 
 
 async def process_pull_request(
@@ -60,6 +122,18 @@ async def process_pull_request(
     demorar o quanto for sem estourar o timeout do webhook. Nunca levanta
     exceção para fora: qualquer erro é logado.
     """
+    # Deduplicação de evento: se este commit (head.sha) já foi revisado
+    # recentemente, pula — evita gasto duplicado de tokens em pushes rápidos.
+    if head_sha:
+        chave = f"{owner}/{repo}#{pull_number}@{head_sha}"
+        if _processed_commits.seen(chave):
+            logger.info(
+                "PR #%s: commit %s já revisado, ignorando.",
+                pull_number,
+                head_sha[:8],
+            )
+            return
+
     try:
         diff = await github_client.get_pull_request_diff(owner, repo, pull_number)
     except Exception:
@@ -77,6 +151,28 @@ async def process_pull_request(
     # review_diff é síncrono (cliente da OpenAI bloqueante); rodamos numa thread
     # para não bloquear o event loop do FastAPI.
     comentarios = await asyncio.to_thread(llm_reviewer.review_diff, diff, pr_title)
+
+    # Filtro por severidade mínima (config MIN_SEVERITY).
+    total_bruto = len(comentarios)
+    comentarios = _filter_by_severity(comentarios, settings.MIN_SEVERITY)
+    if total_bruto != len(comentarios):
+        logger.info(
+            "PR #%s: filtro de severidade (>= %s) manteve %d de %d comentário(s).",
+            pull_number,
+            settings.MIN_SEVERITY,
+            len(comentarios),
+            total_bruto,
+        )
+
+    # Deduplicação por (arquivo, linha), mantendo a maior severidade.
+    antes_dedupe = len(comentarios)
+    comentarios = _dedupe_comments(comentarios)
+    if antes_dedupe != len(comentarios):
+        logger.info(
+            "PR #%s: deduplicação removeu %d comentário(s) na mesma linha.",
+            pull_number,
+            antes_dedupe - len(comentarios),
+        )
 
     # commit_id necessário para ancorar os comentários de linha. Prefere o SHA
     # que já veio no webhook; se faltar, busca via API.
@@ -98,7 +194,7 @@ async def process_pull_request(
         logger.info("Postagem da review (PR #%s): %s", pull_number, resultado)
         return
 
-    # Caso 2: há comentários → loga cada um e posta como review por linha.
+    # Caso 2: há comentários → loga cada um e posta a review.
     logger.info(
         "Revisão do PR #%s: %d comentário(s) gerado(s):", pull_number, len(comentarios)
     )
@@ -112,46 +208,27 @@ async def process_pull_request(
             c.get("comentario"),
         )
 
-    gh_comments = _to_github_comments(comentarios)
-
-    # Se NENHUM comentário pôde ser ancorado em linha, não postamos uma review
-    # vazia (que descartaria os achados): mandamos tudo no corpo da review.
-    if not gh_comments:
-        logger.warning(
-            "PR #%s: nenhum dos %d comentário(s) tinha arquivo/linha válidos; "
-            "postando como review geral no corpo.",
+    # Separa, com base no diff, quem pode ser ancorado na linha (ancorados) e
+    # quem precisa ir para o corpo (overflow). Os que a API aceitaria como
+    # comentário de linha ficam ancorados; só os inválidos viram texto no corpo.
+    valid_lines = github_client.valid_diff_lines(diff)
+    ancorados, overflow = _split_comments(comentarios, valid_lines)
+    if overflow:
+        logger.info(
+            "PR #%s: %d comentário(s) ancorado(s) na linha, %d movido(s) para o "
+            "corpo (linha fora do diff).",
             pull_number,
-            len(comentarios),
-        )
-        linhas = ["🤖 Revisão automática de código", ""]
-        for c in comentarios:
-            emoji = SEVERIDADE_EMOJI.get(c.get("severidade"), "⚪")
-            linhas.append(
-                f"- {emoji} **[{c.get('severidade', 'baixa')}]** "
-                f"{c.get('arquivo')}:{c.get('linha_aproximada')} — "
-                f"{c.get('comentario', '')}"
-            )
-        resultado = await github_client.submit_pr_review(
-            owner,
-            repo,
-            pull_number,
-            comments=[],
-            commit_id=commit_id,
-            body="\n".join(linhas),
-        )
-        logger.info("Postagem da review (PR #%s): %s", pull_number, resultado)
-        return
-
-    if len(gh_comments) < len(comentarios):
-        logger.warning(
-            "PR #%s: %d comentário(s) sem arquivo/linha válidos foram descartados "
-            "da postagem por linha (os demais foram postados).",
-            pull_number,
-            len(comentarios) - len(gh_comments),
+            len(ancorados),
+            len(overflow),
         )
 
     resultado = await github_client.submit_pr_review(
-        owner, repo, pull_number, comments=gh_comments, commit_id=commit_id
+        owner,
+        repo,
+        pull_number,
+        comments=ancorados,
+        commit_id=commit_id,
+        overflow=overflow,
     )
     logger.info("Postagem da review (PR #%s): %s", pull_number, resultado)
 

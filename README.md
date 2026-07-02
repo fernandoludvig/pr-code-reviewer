@@ -4,10 +4,11 @@ Bot que revisa **Pull Requests do GitHub** automaticamente. Ele recebe eventos d
 via webhook, envia o diff do código para um LLM e posta comentários de revisão
 diretamente no Pull Request.
 
-> **Status atual: Fase 3 — postagem da review no PR.**
-> Fluxo completo: recebe o PR → busca o diff → gera comentários com um LLM →
-> **posta a review de volta no Pull Request** (event `COMMENT`, sem aprovar nem
-> bloquear). Veja o [Roadmap](#roadmap).
+> **Status atual: Fase 4 — robustez.**
+> Fluxo completo (recebe o PR → busca o diff → LLM → **posta a review no PR**),
+> agora com filtro por severidade, deduplicação, comentários ancorados na linha
+> com overflow para o corpo, e cache anti-reprocessamento. Veja o
+> [Roadmap](#roadmap) e as [Limitações conhecidas](#limitações-conhecidas).
 
 ---
 
@@ -75,6 +76,20 @@ e boas práticas em cada PR aberto ou atualizado.
   como uma **review geral** (comentários no corpo), sem derrubar a aplicação.
 - Requer `GITHUB_TOKEN` com permissão **Pull requests: Read and write**.
 
+### Fase 4 — Robustez
+
+- **Filtro por severidade** (`MIN_SEVERITY`): posta só o que estiver acima do
+  limite (`baixa` < `media` < `alta`; padrão `media`).
+- **Deduplicação:** se o LLM gera dois comentários para a mesma
+  `(arquivo, linha)`, mantém só o de maior severidade.
+- **Ancoragem precisa com overflow:** em vez de jogar tudo no corpo quando uma
+  linha não está no diff, o bot **parseia o diff** para saber quais linhas são
+  comentáveis. Os comentários válidos ficam **ancorados na linha**; só os que
+  caem fora do diff vão para o **corpo** da review — nada é descartado.
+- **Anti-reprocessamento:** um cache em memória guarda o `head.sha` já revisado
+  por PR (TTL). Pushes rápidos que disparam vários `synchronize` não gastam
+  chamadas ao LLM duas vezes para o mesmo commit.
+
 ---
 
 ## Estrutura do projeto
@@ -85,8 +100,9 @@ pr-code-reviewer/
 │   ├── __init__.py
 │   ├── main.py           # App FastAPI + rotas de status
 │   ├── webhook.py        # Rota que recebe/valida os eventos + orquestra a revisão
-│   ├── github_client.py  # Funções para chamar a API do GitHub (buscar diff)
+│   ├── github_client.py  # API do GitHub: buscar diff, postar review, parsear linhas
 │   ├── llm_reviewer.py   # Revisão de código via LLM (OpenAI)
+│   ├── dedup_cache.py    # Cache TTL em memória (anti-reprocessamento)
 │   └── config.py         # Carregamento de variáveis de ambiente
 ├── .env.example
 ├── .gitignore
@@ -126,6 +142,8 @@ Edite o `.env` e preencha:
 - `OPENAI_API_KEY` — chave da API da OpenAI, usada na revisão via LLM.
   Gere em <https://platform.openai.com/api-keys>.
 - `OPENAI_MODEL` *(opcional)* — modelo usado na revisão. Padrão: `gpt-4o-mini`.
+- `MIN_SEVERITY` *(opcional)* — severidade mínima para postar um comentário:
+  `baixa` < `media` < `alta`. Padrão: `media` (posta média e alta).
 
 ### 3. Subir o servidor
 
@@ -209,4 +227,26 @@ Cole o token em `GITHUB_TOKEN` no `.env`.
 - [x] **Fase 1** — Recepção e validação de webhooks do GitHub.
 - [x] **Fase 2** — Buscar o diff do PR e analisá-lo com um LLM (comentários no log).
 - [x] **Fase 3** — Postar os comentários de revisão de volta no PR (review `COMMENT`).
-- [ ] **Fase 4** — Refinos: deduplicação, filtros por severidade, retry por comentário.
+- [x] **Fase 4** — Robustez: filtro por severidade, deduplicação, ancoragem
+  precisa com overflow, e cache anti-reprocessamento.
+
+---
+
+## Limitações conhecidas
+
+Pontos que são conscientemente simplificados neste escopo de portfólio e que,
+em produção real, mereceriam evolução:
+
+- **Cache anti-reprocessamento é só em memória** (`app/dedup_cache.py`): um dict
+  no processo, com TTL. Ele **reseta se o servidor reiniciar** e **não é
+  compartilhado entre múltiplas instâncias**. Em produção usaria Redis ou um
+  banco de dados para persistir e coordenar entre réplicas.
+- **`linha_aproximada` vem do LLM:** a ancoragem depende de o modelo estimar a
+  linha corretamente. O parsing do diff mitiga isso (linhas fora do diff caem no
+  corpo), mas não garante a linha semanticamente perfeita.
+- **Sem retentativa/enfileiramento:** se a chamada ao LLM ou ao GitHub falhar, o
+  evento é apenas logado — não há retry com backoff nem fila (ex.: Celery/RQ).
+- **Truncamento de diffs grandes:** diffs muito extensos são cortados (~6000
+  tokens), então PRs enormes podem não ser revisados por completo.
+- **Processamento via `BackgroundTasks`:** roda no mesmo processo do servidor;
+  cargas altas se beneficiariam de um worker/fila dedicado.
